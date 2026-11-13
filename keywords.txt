@@ -1,0 +1,13 @@
+BNO085Multi	KEYWORD1
+Sensor	KEYWORD1
+SensorConfig	KEYWORD1
+ManagerConfig	KEYWORD1
+Quaternion	KEYWORD1
+Diagnostics	KEYWORD1
+begin	KEYWORD2
+update	KEYWORD2
+latest	KEYWORD2
+quaternion	KEYWORD2
+diagnostics	KEYWORD2
+recover	KEYWORD2
+streaming	KEYWORD2
