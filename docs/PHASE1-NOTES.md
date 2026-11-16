@@ -43,10 +43,72 @@ SPI mode 3 at 1 MHz, pins 12/11/13/10/9/8):
 | First packet | `len=552 ch=0 seq=0`, continuation bit clear |
 | Packet consumption | 552 B drained in 3 bounded chunks; then INT deasserted (no leftover fragments) |
 | `sizeof(Quaternion)` / `sizeof(Diagnostics)` | 44 B / 124 B |
+| Transport drain of the 552 B advertisement | one `Oversize` result, 4 bus transactions (peek + 256 + 256 + 40), device idle afterwards, 0 bad fragments, 0 short fragments, 0 rx errors |
+| Timestamps drift / cold boots | not measured (stages 3–8 not started) |
 
-**Host tests:** 150 checks across 28 cases, 0 failures, via
+**Host tests:** 168 checks across 30 cases, 0 failures, via
 `test\native\build_msvc.bat` (MSVC 2022). See `test/native/README.md` for what each
 case covers and for the simulated-versus-real distinction.
+
+## Transport fix: oversized transfer drain (validated on hardware)
+
+**Failure.** Every cold boot, `service()` returned `Oversize` for the 552-byte
+channel-0 advertisement and left the stream desynchronised: the device kept INT
+asserted, and each following `service()` parsed payload bytes as a header, so it
+reported malformed/oversize results indefinitely. Probe v2 showed the same symptom as
+295 consecutive transfer failures.
+
+**Root cause.** Byte accounting, not protocol design. `service()` peeks the 4-byte
+header with a non-consuming read and then re-reads the transfer from the start, so
+`length` (which counts the whole transfer) is still entirely on the wire. The oversize
+drain subtracted the header (`remaining = length - 4`) and clocked out only 548 of 552
+bytes. The device re-presented the surviving 4 payload bytes, and the transport read
+them as a length/channel/sequence. Same off-by-4 on each continuation fragment
+(`lenNext - 4`). `discard()` was already correct because it drains `length` bytes from
+the start.
+
+**Fix.** Two expressions changed to drain the full `length` / `lenNext`; plus removal
+of an `rxErrors` increment that flagged a legal, fully-drained transfer as a bus
+error (it made a healthy boot indistinguishable from a desync in diagnostics).
+Nothing else changed: per-sensor SHTP context, shared bus manager, buffer sizes,
+result codes, timeouts and the bounded 8-fragment guard are untouched.
+
+**Procedure.**
+
+1. `test\native\build_msvc.bat` — 30 cases / 168 checks.
+2. Re-introduce `length - 4` temporarily: 6 checks fail in the two regression cases,
+   confirming the tests detect the defect rather than merely coexisting with it.
+3. Compile `test/hardware/02_TransportDrain` for `esp32:esp32:esp32s3`.
+4. `arduino-cli upload -p COM11 --fqbn esp32:esp32:esp32s3 --input-dir build/transportdrain`.
+5. `arduino-cli monitor -p COM11 -c baudrate=115200` for 20 s.
+
+The harness drives the real `ShtpTransport` — reset, then `service()` while INT is
+asserted — with no SH-2 traffic, so it does not begin stage 3.
+
+**Observed (COM11, 2026-11-16):**
+
+```
+=== BNO085Multi transport drain validation ===
+hal.begin -> ok
+boot: INT asserted after 93889 us (up)
+servicing while INT asserted:
+  service[1] -> Oversize
+  INT deasserted: device idle
+service calls=1 oversize=1 ok=0 other=0
+final service -> NoData (idle, no stranded tail)
+stats: packets=0 bytes=0 oversizePayloads=1 badFragments=0 shortFragments=0
+       badChannels=0 seqGaps=0 rxErrors=0
+bus transactions=4 lockTimeouts=0 busErrors=0
+RESULT: PASS - oversized transfer fully drained, stream idle
+```
+
+Four bus transactions is 1 peek + 3 reads totalling 552 bytes, i.e. the header is
+re-read as part of the first chunk and exactly the transfer is consumed. Log:
+`build/transportdrain_run3.log`.
+
+**Not proven by this.** The drain is fixed and the stream returns to idle after the
+advertisement; nothing here exercises SH-2, report configuration, timestamps or
+soak behaviour, which remain stages 3–8.
 
 **Compilation:** `examples/01_SingleSensor` compiles for `esp32:esp32:esp32s3`
 (ESP32 core 3.3.12), 324 262 B flash (24 %), 23 880 B static RAM (7 %).

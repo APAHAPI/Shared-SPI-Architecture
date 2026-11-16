@@ -19,9 +19,9 @@ Kept deliberately granular. "Compiles" is not "works", and simulated is not phys
 | --- | --- |
 | Implemented | HAL, shared SPI bus manager, per-instance SHTP transport, minimal SH-2 (product ID, reset, set/get feature, Rotation Vector), `Sensor` state machine, CRC-framed binary output, single-sensor example, host test suite |
 | Compiled | `esp32:esp32:esp32s3`, ESP32 Arduino core 3.3.12 — 324 262 B flash (24 %), 23 880 B static RAM (7 %) for the example |
-| Host-unit-tested | 28 cases / 150 checks, 0 failures (MSVC 2022, `test/native`) |
+| Host-unit-tested | 30 cases / 168 checks, 0 failures (MSVC 2022, `test/native`) |
 | Simulated | Mock-HAL, single device. No 20-instance simulation yet |
-| Physically tested | Stages 1–2 only: ESP32-S3 + Adafruit BNO085 on COM11 (CH343 UART bridge), SPI mode 3 @ 1 MHz. Boot after reset **93.7 ms**; advertisement is **552 B on channel 0**, drained completely; 0 bus errors, 0 lock timeouts |
+| Physically tested | Stages 1–2 plus the oversized-transfer drain: ESP32-S3 + Adafruit BNO085 on COM11 (CH343 UART bridge), SPI mode 3 @ 1 MHz. Boot after reset **93.7 ms**; the **552 B channel-0 advertisement** is drained in 4 bus transactions and the stream returns to idle; 0 bad fragments, 0 bus errors, 0 lock timeouts |
 
 Not yet physically tested: product ID retrieval, Rotation Vector configuration at
 100 Hz, report decode, the 10-minute soak, the disconnected-INT timeout, 30 cold boots,
@@ -80,6 +80,7 @@ call. Sensors reach `Streaming` asynchronously.
 | --- | --- |
 | `examples/01_SingleSensor` | Full Phase 1 acceptance sketch: init, streaming quaternions, `r`/`d`/`q`/`h` serial commands, optional binary output (`BNO085_BINARY_OUTPUT 1`) |
 | `test/hardware/01_HeaderProbe` | Diagnostic stage 1–2 sketch: measures boot time, prints raw SHTP headers and drains complete packets without involving SH-2. Use this first when bringing up new wiring |
+| `test/hardware/02_TransportDrain` | Regression harness for the fix above: drives the real `ShtpTransport` against the device and asserts the oversized advertisement leaves nothing stranded and the stream goes idle |
 
 ## Tests
 
@@ -91,8 +92,9 @@ sh test/native/build_gcc.sh     # any host with g++
 ```
 
 They cover CRC vectors, frame encoding, SHTP header parsing, invalid length/channel,
-fragmentation, sequence handling, Rotation Vector decode, Q14 conversion, timestamp
-reconstruction, timeouts and the init state machine. See
+oversized-transfer drain (including the regression that the whole transfer must be
+consumed), fragmentation, sequence handling, Rotation Vector decode, Q14 conversion,
+timestamp reconstruction, timeouts and the init state machine. See
 [test/native/README.md](test/native/README.md) for what is simulated and what is not.
 
 ## Documents

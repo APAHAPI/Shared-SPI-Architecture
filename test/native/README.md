@@ -32,6 +32,7 @@ is what the hardware bring-up checklist is for.
 | Frame encoder | 34-byte quaternion frame, field offsets, CRC range, corruption detection |
 | SHTP accept | valid rotation-vector transfer, reception timestamp propagation, sequence gap counting |
 | SHTP reject | no data, zero length, short fragment, reserved length, bad channel, oversize transfer, payload larger than payload buffer, unexpected continuation, bus error |
+| SHTP oversize drain | 552-byte advertisement consumed completely (nothing stranded, device idle afterwards), oversized continuation chain drained fragment by fragment, report arriving right after an oversize still decodes |
 | SH-2 control | product id (4/5 entry forms), set-feature byte layout, hub rejection, command timeout, reset-complete |
 | SH-2 reports | RV decode (Q14 + accuracy), delay ticks and timestamp reconstruction, duplicate suppression, report gaps, unknown report id |
 | Sensor FSM | full boot → identify → configure → get-feature → streaming, boot timeout, unsupported report rejection, recovery from a malformed transfer, recovery backoff |
@@ -57,8 +58,15 @@ Both print `RESULT: PASS` and exit non-zero on failure.
 `build_gcc.sh` is provided for portability but has not been executed in this
 environment (no g++ is installed here); the MSVC build is the one that ran.
 
-Fragmented SHTP payloads are rejected rather than reassembled. With
+Oversized SHTP transfers are drained rather than reassembled. With
 `kRxTransferBytes` = 256 and `kRxPayloadBytes` = 192, every payload the device
-can produce fits in one transfer, so the continuation path is unreachable in
-this configuration; it is still validated so a rogue continuation is reported as
-malformed instead of corrupting the assembly buffer.
+can produce fits in one transfer, but the channel-0 advertisement (552 B on the
+tested part) does not, so the drain path runs on every cold boot.
+
+The drain accounting invariant, which the mock enforces and which the hardware
+confirmed: the 4-byte header peek does not consume anything, so a read that
+starts a transfer must clock out the full `length` bytes, header included.
+Draining `length - 4` strands 4 payload bytes; the device then re-presents them
+and the next `service()` parses payload as a header. Two regression cases cover
+this (`shtp_oversize_drain_complete`, `shtp_oversize_continuation`) and both
+fail if the subtraction is reintroduced.

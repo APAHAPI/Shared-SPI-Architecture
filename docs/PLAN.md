@@ -154,11 +154,12 @@ Updated after Phase 1. See `PHASE1-NOTES.md` for evidence and the open items.
 
 - **Compiled:** `esp32:esp32:esp32s3` (ESP32 Arduino core 3.3.12), example and
   diagnostic sketch.
-- **Unit tested:** 28 host cases / 150 checks, 0 failures (MSVC 2022).
+- **Unit tested:** 30 host cases / 168 checks, 0 failures (MSVC 2022).
 - **Simulated:** single mock device only; no 20-instance simulation yet.
-- **Hardware validated:** stages 1–2 (bus, CS, SHTP framing, 552 B advertisement
-  drained, boot 93.7 ms). Product ID, Rotation Vector configuration and streaming are
-  still open.
+- **Hardware validated:** stages 1–2 (bus, CS, SHTP framing, boot 93.7 ms) and the
+  oversized-transfer drain (552 B advertisement consumed in 4 bus transactions, stream
+  returns to idle). Product ID, Rotation Vector configuration and streaming are still
+  open.
 
 Every remaining performance number in RESOURCE-ANALYSIS.md is still a calculation with
 stated assumptions until the corresponding hardware stage runs.

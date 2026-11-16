@@ -144,19 +144,23 @@ ShtpResult ShtpTransport::service(uint32_t tEdgeUs) {
   nextInSeq_[channel] = static_cast<uint8_t>(sequence + 1);
 
   if (length > sizeof(rxTransfer_)) {
-    // Legal partial read: the device re-presents the remainder with a new,
-    // shorter length on the next transfer.
+    // Legal but unbufferable transfer: it is counted, then drained in this call
+    // so the device never has to re-present a remainder. Not an rx error - the
+    // transfer behaved exactly as the protocol allows, and an error flag here
+    // would make a healthy boot indistinguishable from a desync.
     ++stats_.oversizePayloads;
-    ++stats_.rxErrors;
     // Consume the whole transfer before returning. Leaving the remainder
     // pending makes the device re-present it as continuation fragments, which
     // then look like a stream of bogus fragments on the next service() calls.
     // The payload cannot be assembled at this buffer size, so it is counted and
     // discarded. Bounded to 8 fragments; a rogue device cannot spin here.
+    //
+    // `length` counts the whole transfer, header included, and the peek above
+    // consumed nothing, so all `length` bytes are still on the wire. Draining
+    // length - 4 strands the last 4 payload bytes; the device then re-presents
+    // them and the next service() parses payload as a header.
     {
-      size_t remaining = (length > shtp::kHeaderLen)
-                             ? static_cast<size_t>(length - shtp::kHeaderLen)
-                             : 0u;
+      size_t remaining = static_cast<size_t>(length);
       bool more = continuation;
       uint8_t guard = 0;
       for (;;) {
@@ -188,7 +192,9 @@ ShtpResult ShtpTransport::service(uint32_t tEdgeUs) {
           break;
         }
         more = (rawNext & shtp::kContinuationBit) != 0;
-        remaining = static_cast<size_t>(lenNext - shtp::kHeaderLen);
+        // Same rule for each continuation fragment: its own header is part of
+        // the count and was not consumed by the read that just finished.
+        remaining = static_cast<size_t>(lenNext);
       }
     }
     if (log_) log_->log(LogLevel::Warn, LogShtp,

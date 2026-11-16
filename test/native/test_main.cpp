@@ -351,6 +351,53 @@ void testShtpPayloadExceedsPayloadBuffer() {
   CHECK(fx.shtp.stats().oversizePayloads == 1);
 }
 
+// Regression for the oversized-transfer drain. The 4-byte header peek does not
+// consume anything, so the drain must clock out the full `length` bytes. Taking
+// length - 4 stranded the last 4 payload bytes; the device re-presented them and
+// every later service() parsed payload as a header (bad channel / short fragment
+// storm, INT never deasserting). The 552-byte advertisement hits this on every
+// cold boot.
+void testShtpOversizeDrainConsumesWholeTransfer() {
+  TransportFixture fx;
+  const std::vector<uint8_t> payload(548, 0x5A);  // 552 bytes total: advertisement
+  fx.hal.queuePacket(makePacket(0, 0, payload));
+
+  CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Oversize);
+  CHECK(fx.shtp.stats().oversizePayloads == 1);
+  CHECK(fx.hal.queue.empty());     // nothing stranded on the wire
+  CHECK(fx.hal.partialPos == 0);
+  CHECK(fx.shtp.stats().badFragments == 0);
+  CHECK(fx.shtp.stats().shortFragments == 0);
+
+  // The device must now be idle instead of holding a 4-byte tail.
+  CHECK(fx.shtp.service(2000) == bno085::ShtpResult::NoData);
+
+  // A real report arriving right after the advertisement still decodes.
+  fx.hal.queuePacket(makePacket(3, 0, makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0)));
+  CHECK(fx.shtp.service(3000) == bno085::ShtpResult::Ok);
+  CHECK(fx.calls == 1);
+  CHECK(fx.lastChannel == 3);
+  CHECK(fx.shtp.stats().badFragments == 0);
+  CHECK(fx.shtp.stats().shortFragments == 0);
+}
+
+// A continuation chain must drain every fragment by its own length, including
+// the fragment header, and still end idle.
+void testShtpOversizeContinuationChain() {
+  TransportFixture fx;
+  const std::vector<uint8_t> first(548, 0x11);   // 552, continuation set
+  const std::vector<uint8_t> second(300, 0x22);  // 304, also oversized
+  fx.hal.queuePacket(makePacket(0, 0, first, true));
+  fx.hal.queuePacket(makePacket(0, 1, second, false));
+
+  CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Oversize);
+  CHECK(fx.hal.queue.empty());
+  CHECK(fx.hal.partialPos == 0);
+  CHECK(fx.shtp.stats().badFragments == 0);
+  CHECK(fx.shtp.stats().shortFragments == 0);
+  CHECK(fx.shtp.service(2000) == bno085::ShtpResult::NoData);
+}
+
 void testShtpUnexpectedContinuation() {
   TransportFixture fx;
   const std::vector<uint8_t> payload(6, 0x22);
@@ -631,6 +678,8 @@ int main() {
       {"shtp_bad_channel", testShtpBadChannel},
       {"shtp_oversize_transfer", testShtpOversizeTransfer},
       {"shtp_payload_too_large", testShtpPayloadExceedsPayloadBuffer},
+      {"shtp_oversize_drain_complete", testShtpOversizeDrainConsumesWholeTransfer},
+      {"shtp_oversize_continuation", testShtpOversizeContinuationChain},
       {"shtp_unexpected_continuation", testShtpUnexpectedContinuation},
       {"shtp_bus_error", testShtpBusError},
       {"shtp_sequence_gap", testShtpSequenceGapIsCounted},
