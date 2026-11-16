@@ -1,0 +1,9 @@
+# Build / tooling artefacts
+.tools/
+build/
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+.DS_Store
