@@ -150,13 +150,18 @@ not an afterthought: it is how framing bugs get caught without a scope.
 
 ## 4. Validation status
 
-- **Compiled:** nothing.
-- **Unit tested:** nothing.
-- **Simulated:** nothing.
-- **Hardware validated:** nothing.
+Updated after Phase 1. See `PHASE1-NOTES.md` for evidence and the open items.
 
-The architecture phase produces documents only. Every performance number in
-RESOURCE-ANALYSIS.md is a calculation with stated assumptions.
+- **Compiled:** `esp32:esp32:esp32s3` (ESP32 Arduino core 3.3.12), example and
+  diagnostic sketch.
+- **Unit tested:** 28 host cases / 150 checks, 0 failures (MSVC 2022).
+- **Simulated:** single mock device only; no 20-instance simulation yet.
+- **Hardware validated:** stages 1–2 (bus, CS, SHTP framing, 552 B advertisement
+  drained, boot 93.7 ms). Product ID, Rotation Vector configuration and streaming are
+  still open.
+
+Every remaining performance number in RESOURCE-ANALYSIS.md is still a calculation with
+stated assumptions until the corresponding hardware stage runs.
 
 ---
 

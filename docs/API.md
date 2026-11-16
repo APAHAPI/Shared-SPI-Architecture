@@ -1,7 +1,8 @@
 # Public API and output protocol (proposal)
 
-Phase 0 deliverable — interface design for review. Nothing is implemented yet; these
-signatures are the contract the implementation will be written against.
+Phase 0 deliverable — interface design for review. These signatures are the contract
+the implementation is written against. The Phase 1 subset is implemented; see
+`PHASE1-NOTES.md` for exactly which parts, and §4.1 for the 16-bit frame sequence.
 
 Namespace: `bno085`. Umbrella header: `<BNO085Multi.h>`.
 

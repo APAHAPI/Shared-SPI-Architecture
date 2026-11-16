@@ -1,6 +1,8 @@
 # BNO085Multi — Architecture
 
-Phase 0 deliverable. Documentation only; no code exists yet.
+Phase 0 deliverable — the approved architecture. Phase 1 code now exists and follows
+this design; see `PHASE1-NOTES.md` for what is implemented, what deviates and what is
+verified on hardware.
 
 ---
 

@@ -2,46 +2,143 @@
 
 A ground-up Arduino library for **1–20 BNO085 IMUs on one shared SPI bus**, built for a
 professional motion-capture system. The BNO085 performs its own sensor fusion; the
-ESP32-S3 only moves bytes, keeps state separate per device, timestamps, aggregates and
-forwards.
+ESP32-S3 only moves bytes, keeps state separate per device, timestamps and forwards.
 
-> **Status: Phase 0 — architecture review.**
-> No driver source has been written yet, by design. The documents below are the
-> deliverable; implementation starts after review. Nothing here has been validated on
-> hardware, and no claim of hardware validation is made anywhere in this repository.
+> **Status: Phase 1 — single-sensor baseline.**
+> The driver source exists, compiles for the ESP32-S3 and passes its host tests.
+> Hardware validation is **in progress**: stages 1–2 (bus, CS, SHTP framing) are
+> confirmed on a physical BNO085; stage 3 onwards (product ID, Rotation Vector
+> configuration, streaming) is not yet confirmed. See
+> [Validation status](#validation-status) for the exact split.
+
+## Validation status
+
+Kept deliberately granular. "Compiles" is not "works", and simulated is not physical.
+
+| Category | State |
+| --- | --- |
+| Implemented | HAL, shared SPI bus manager, per-instance SHTP transport, minimal SH-2 (product ID, reset, set/get feature, Rotation Vector), `Sensor` state machine, CRC-framed binary output, single-sensor example, host test suite |
+| Compiled | `esp32:esp32:esp32s3`, ESP32 Arduino core 3.3.12 — 324 262 B flash (24 %), 23 880 B static RAM (7 %) for the example |
+| Host-unit-tested | 28 cases / 150 checks, 0 failures (MSVC 2022, `test/native`) |
+| Simulated | Mock-HAL, single device. No 20-instance simulation yet |
+| Physically tested | Stages 1–2 only: ESP32-S3 + Adafruit BNO085 on COM11 (CH343 UART bridge), SPI mode 3 @ 1 MHz. Boot after reset **93.7 ms**; advertisement is **552 B on channel 0**, drained completely; 0 bus errors, 0 lock timeouts |
+
+Not yet physically tested: product ID retrieval, Rotation Vector configuration at
+100 Hz, report decode, the 10-minute soak, the disconnected-INT timeout, 30 cold boots,
+and comparison against the Adafruit library.
+
+## Hardware baseline
+
+| Signal | GPIO |
+| --- | --- |
+| SCK | 12 |
+| MOSI / DI | 11 |
+| MISO / DO | 13 |
+| CS | 10 |
+| INT (H_INTN, active low) | 9 |
+| RST (NRST, active low) | 8 |
+
+3.3 V and common ground; **PS0 and PS1 HIGH at reset** to select SPI mode; SPI mode 3,
+1 MHz initial clock (3 MHz is the datasheet ceiling and is opt-in).
+
+## Installing
+
+This repository is the library root, so the folder must be named `BNO085Multi` when it
+is placed in the Arduino libraries directory (Arduino derives the library name from the
+folder). Then open **File → Examples → BNO085Multi → 01_SingleSensor**.
+
+## Quick start
+
+```cpp
+#include <BNO085Multi.h>
+
+bno085::SensorConfig cfg(10, 9, 8);          // CS, INT, RST
+bno085::SpiBusManager bus;
+bno085::Esp32SpiHal hal(bus, &SPI, managerCfg, cfg);
+bno085::Sensor imu(hal);
+
+void setup() {
+  Serial.begin(115200);
+  managerCfg.sckPin = 12; managerCfg.misoPin = 13; managerCfg.mosiPin = 11;
+  if (!imu.begin(managerCfg, cfg).ok()) { /* inspect imu.lastError() */ }
+}
+
+void loop() {
+  imu.update();                              // non-blocking, bounded
+  bno085::Quaternion q;
+  if (imu.latest(q)) { /* q.w/x/y/z, q.rawW..rawZ, q.accuracy, q.tMeasUs, q.tHostUs */ }
+}
+```
+
+`begin()` never blocks on the device: it validates, opens the bus and starts the
+initialisation state machine, which `update()` advances by at most a bounded budget per
+call. Sensors reach `Streaming` asynchronously.
+
+## Examples and hardware sketches
+
+| Sketch | Purpose |
+| --- | --- |
+| `examples/01_SingleSensor` | Full Phase 1 acceptance sketch: init, streaming quaternions, `r`/`d`/`q`/`h` serial commands, optional binary output (`BNO085_BINARY_OUTPUT 1`) |
+| `test/hardware/01_HeaderProbe` | Diagnostic stage 1–2 sketch: measures boot time, prints raw SHTP headers and drains complete packets without involving SH-2. Use this first when bringing up new wiring |
+
+## Tests
+
+Host tests (no hardware, no Arduino):
+
+```
+test\native\build_msvc.bat      # Windows / MSVC
+sh test/native/build_gcc.sh     # any host with g++
+```
+
+They cover CRC vectors, frame encoding, SHTP header parsing, invalid length/channel,
+fragmentation, sequence handling, Rotation Vector decode, Q14 conversion, timestamp
+reconstruction, timeouts and the init state machine. See
+[test/native/README.md](test/native/README.md) for what is simulated and what is not.
 
 ## Documents
 
 | Document | Contents |
 | --- | --- |
+| [docs/PHASE1-NOTES.md](docs/PHASE1-NOTES.md) | What Phase 1 implements, deviations from the approved architecture, evidence gathered, and the remaining hardware checklist |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Directory layout, layer diagram, data flow, state ownership, SPI scheduling, reset/recovery, documented compromises |
 | [docs/UPSTREAM-AUDIT.md](docs/UPSTREAM-AUDIT.md) | Audit of CEVA SH-2/SHTP and the Adafruit driver: every global/static that blocks multi-instance use, the probable cause of the `begin_SPI()` hang, and the exact patch set if upstream were forked |
 | [docs/RESOURCE-ANALYSIS.md](docs/RESOURCE-ANALYSIS.md) | Memory tables for 1/5/10/15/20 sensors, SPI bandwidth and latency calculations, USB output budget, init-time budget |
-| [docs/API.md](docs/API.md) | Proposed public API, per-sensor report configuration, binary output protocol (framing, packet types, CRC), JSON debug mode |
-| [docs/PLAN.md](docs/PLAN.md) | Technical risks with mitigations, phased implementation plan with exit criteria, test strategy, open decisions for review |
-
-## Target baseline
-
-- **MCU:** ESP32-S3, Arduino framework (ESP32 Arduino core).
-- **IMU:** Adafruit BNO085 breakout, SPI mode 3, 1 MHz bring-up / 3 MHz maximum.
-- **Bus:** one shared SPI peripheral, one CS per sensor, one INT per sensor
-  (optional), reset shared or per sensor.
-- **Link to PC:** USB CDC serial, compact binary framing with CRC-16.
+| [docs/API.md](docs/API.md) | Public API, per-sensor report configuration, binary output protocol (framing, packet types, CRC) |
+| [docs/PLAN.md](docs/PLAN.md) | Technical risks with mitigations, phased plan with exit criteria, test strategy, open decisions |
 
 ## Design in one paragraph
 
 Four independent layers plus a scheduler: a **HAL** (SPI transactions, CS, INT, reset,
 time), a **shared SPI bus manager** (one mutex, one transaction at a time, CS always
-released), a **per-sensor SHTP transport** (framing, channels, sequence numbers,
-fragment assembly, bounded reads) and a **per-sensor SH-2 client** (product ID, report
-configuration, report decode, hub timestamping). A **manager** owns the sensor table
-and runs a non-blocking round-robin scheduler over INT-driven service requests; an
-**aggregator** stamps every record with sensor ID plus both measurement and reception
-time; an **output encoder** writes a versioned binary frame with CRC-16. Changing the
-sensor count is a runtime parameter — `begin(configs, n)` — never a source edit.
+released on every exit path), a **per-sensor SHTP transport** (framing, channels,
+sequence numbers, bounded reads) and a **per-sensor SH-2 client** (product ID, report
+configuration, report decode, hub timestamping). Each `Sensor` owns its SHTP and SH-2
+context, so nothing about a device lives in file-scope state. Changing the sensor count
+is a runtime parameter, never a source edit.
+
+Timestamps: `tHostUs` is ESP32 `micros()` at INT assertion; `tMeasUs` is the device's
+own measurement time, `tMeas = tEdge − 12 000 µs + delayTicks × 100 µs`, kept in a
+separate clock domain and never merged. Quaternion components are reported as
+`x = i/16384, y = j/16384, z = k/16384, w = real/16384`, with the raw Q14 integers
+preserved alongside.
+
+## Phase 1 limitations
+
+- One physical sensor. Multi-sensor scheduling, `Manager`, aggregation and ring buffers
+  are Phase 2+; the per-instance design is what makes that a scheduling change rather
+  than a rewrite.
+- Rotation Vector only. A Game Rotation Vector request is rejected rather than
+  silently substituted.
+- `Sensor::get()` returns `false`; optional reports are not decoded yet.
+- Fragmented payloads are drained and counted, not reassembled — the advertisement on
+  this part is 552 B, larger than the transfer buffer.
+- No ESP32-side orientation maths of any kind.
+
+Full detail, including why each deviation was taken, is in
+[docs/PHASE1-NOTES.md](docs/PHASE1-NOTES.md).
 
 ## Not in scope for v1
 
 Firmware update (DFU), I²C/UART transports, FRS/calibration-record access, tare, and
-`sh2`-API compatibility. All are listed with rationale in
+`sh2`-API compatibility. Rationale in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#9-documented-architectural-compromises).
