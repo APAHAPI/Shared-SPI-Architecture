@@ -14,8 +14,8 @@ constexpr uint8_t kCommandResp         = 0xF1;  // device -> host
 constexpr uint8_t kSetFeatureCmd       = 0xFD;  // host -> device
 constexpr uint8_t kGetFeatureReq       = 0xFE;  // host -> device
 constexpr uint8_t kGetFeatureResp      = 0xFC;  // device -> host
-constexpr uint8_t kBaseTimestampRef    = 0xFA;  // device -> host
-constexpr uint8_t kTimestampRebase     = 0xFB;  // device -> host
+constexpr uint8_t kBaseTimestampRef    = 0xFB;  // device -> host, u32 timebase
+constexpr uint8_t kTimestampRebase     = 0xFA;  // device -> host, i32 timebase
 
 // --- Executable channel commands -----------------------------------------
 constexpr uint8_t kExecReset           = 0x01;

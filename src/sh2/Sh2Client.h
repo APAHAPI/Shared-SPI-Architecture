@@ -86,13 +86,14 @@ class Sh2Client {
   void handleExecutable(const uint8_t* payload, uint16_t len);
   void handleControl(const uint8_t* payload, uint16_t len, uint32_t tUs);
   void handleReports(const uint8_t* payload, uint16_t len, uint32_t tUs);
-  void handleRotationVector(const uint8_t* report, uint8_t length, uint32_t tUs);
+  void handleRotationVector(const uint8_t* report, uint8_t length, uint32_t tUs,
+                            int64_t referenceDeltaTicks);
   void handleProdId(const uint8_t* report);
   void handleCommandResponse(const uint8_t* report);
   void handleGetFeatureResponse(const uint8_t* report);
-  void handleTimestampRebase(const uint8_t* report);
 
-  uint32_t computeMeasTime(uint32_t tEdgeUs, uint16_t delayTicks) const;
+  uint32_t computeMeasTime(uint32_t tEdgeUs, uint16_t delayTicks,
+                           int64_t referenceDeltaTicks) const;
 
   ShtpTransport* transport_;
   Logger* log_;
@@ -109,7 +110,6 @@ class Sh2Client {
   bool cmdPending_;
   uint8_t cmdId_;
   uint8_t cmdSeq_;
-  uint8_t nextCmdSeq_;
   uint32_t cmdDeadlineUs_;
   CmdState cmdState_;
 
@@ -119,7 +119,6 @@ class Sh2Client {
   CmdState featureState_;
   uint32_t grantedIntervalUs_;
 
-  int32_t rebaseOffsetUs_;
   uint32_t epoch_;
 
   bool haveQuaternion_;

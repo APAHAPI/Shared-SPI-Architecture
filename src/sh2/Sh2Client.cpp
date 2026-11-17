@@ -1,28 +1,28 @@
 #include "sh2/Sh2Client.h"
 
-#include <climits>
-
 #include "diag/Logger.h"
 #include "sh2/Sh2Codes.h"
 
 namespace bno085 {
 
 namespace {
-// Datasheet 1000-3927 section 1.3.5: the host timestamps at H_INTN assertion,
-// the timebase reference is 120 * 100 us, and each report adds its own delay.
-constexpr int32_t kTimebaseReferenceUs = -12000;
+// Datasheet 1000-3927 section 1.3.5: the host timestamps at H_INTN assertion and
+// each report adds its own delay in 100 us units. Input payloads carry their own
+// timebase delta (0xFB reference, 0xFA rebase); until a 0xFB arrives, retain the
+// Phase-1 fallback of assuming the documented 12 ms reference.
+constexpr int64_t kDefaultReferenceDeltaTicks = -120;
+constexpr int32_t kTimestampTickUs = 100;
 constexpr float kQ14Scale = 1.0f / 16384.0f;
-constexpr int32_t kRebaseUnitUs = 100;
 } // namespace
 
 Sh2Client::Sh2Client()
     : transport_(nullptr), log_(nullptr), sensorId_(0), handlers_(),
       timeoutMs_(100), product_(), prodEntries_(0), prodExpected_(4),
       prodPending_(false), prodDeadlineUs_(0), cmdPending_(false), cmdId_(0),
-      cmdSeq_(0), nextCmdSeq_(0), cmdDeadlineUs_(0), cmdState_(CmdState::Idle),
+      cmdSeq_(0), cmdDeadlineUs_(0), cmdState_(CmdState::Idle),
       featurePending_(false), featureId_(0), featureDeadlineUs_(0),
       featureState_(CmdState::Idle), grantedIntervalUs_(0),
-      rebaseOffsetUs_(0), epoch_(0), haveQuaternion_(false), lastQuatSeq_(0),
+      epoch_(0), haveQuaternion_(false), lastQuatSeq_(0),
       lastQuatTMeasUs_(0), stats_(), lastError_(ErrorCode::None) {}
 
 void Sh2Client::attach(ShtpTransport* transport, Logger* log, uint8_t sensorId) {
@@ -120,16 +120,6 @@ void Sh2Client::handleControl(const uint8_t* payload, uint16_t len, uint32_t tUs
         break;
       case sh2::kGetFeatureResp:
         handleGetFeatureResponse(payload + cursor);
-        break;
-      case sh2::kTimestampRebase:
-        handleTimestampRebase(payload + cursor);
-        break;
-      case sh2::kBaseTimestampRef:
-        ++stats_.baseTimestampRefs;
-        if (log_) {
-          log_->log(LogLevel::Debug, LogSh2, "s%u base timestamp ref = %u",
-                    sensorId_, static_cast<unsigned>(sh2::readU32(payload + cursor + 1)));
-        }
         break;
       default:
         if (log_) {
@@ -255,24 +245,12 @@ void Sh2Client::handleGetFeatureResponse(const uint8_t* report) {
   }
 }
 
-void Sh2Client::handleTimestampRebase(const uint8_t* report) {
-  const int32_t ticks = static_cast<int32_t>(sh2::readU32(report + 1));
-  const int64_t delta = static_cast<int64_t>(ticks) * kRebaseUnitUs;
-  int64_t accumulated = static_cast<int64_t>(rebaseOffsetUs_) + delta;
-  if (accumulated > INT32_MAX) accumulated = INT32_MAX;
-  if (accumulated < INT32_MIN) accumulated = INT32_MIN;
-  rebaseOffsetUs_ = static_cast<int32_t>(accumulated);
-  ++epoch_;
-  if (log_) {
-    log_->log(LogLevel::Info, LogSh2,
-              "s%u timestamp rebase %ld ticks -> offset %ld us (epoch %u)", sensorId_,
-              static_cast<long>(ticks), static_cast<long>(rebaseOffsetUs_),
-              static_cast<unsigned>(epoch_));
-  }
-}
-
 void Sh2Client::handleReports(const uint8_t* payload, uint16_t len, uint32_t tUs) {
   uint16_t cursor = 0;
+  // Reference sh2.c sensorhubInputHdlr: the timebase delta is local to the
+  // payload being parsed. 0xFB replaces it (negated); 0xFA accumulates onto it.
+  int64_t referenceDeltaTicks = kDefaultReferenceDeltaTicks;
+
   while (cursor < len) {
     const uint8_t id = payload[cursor];
     const uint8_t reportLen = sh2::reportLength(id);
@@ -287,8 +265,29 @@ void Sh2Client::handleReports(const uint8_t* payload, uint16_t len, uint32_t tUs
       break;
     }
 
-    if (id == 0x05) {
-      handleRotationVector(payload + cursor, reportLen, tUs);
+    if (id == sh2::kBaseTimestampRef) {
+      ++stats_.baseTimestampRefs;
+      const uint32_t timebase = sh2::readU32(payload + cursor + 1);
+      referenceDeltaTicks = -static_cast<int64_t>(timebase);
+      if (log_) {
+        log_->log(LogLevel::Debug, LogSh2,
+                  "s%u base timestamp ref %lu ticks -> delta %lld", sensorId_,
+                  static_cast<unsigned long>(timebase),
+                  static_cast<long long>(referenceDeltaTicks));
+      }
+    } else if (id == sh2::kTimestampRebase) {
+      const int32_t ticks = static_cast<int32_t>(sh2::readU32(payload + cursor + 1));
+      referenceDeltaTicks += ticks;
+      ++epoch_;
+      if (log_) {
+        log_->log(LogLevel::Info, LogSh2,
+                  "s%u timestamp rebase %ld ticks -> delta %lld (epoch %u)", sensorId_,
+                  static_cast<long>(ticks),
+                  static_cast<long long>(referenceDeltaTicks),
+                  static_cast<unsigned>(epoch_));
+      }
+    } else if (id == 0x05) {
+      handleRotationVector(payload + cursor, reportLen, tUs, referenceDeltaTicks);
     } else if (handlers_.sensorReport != nullptr) {
       handlers_.sensorReport(handlers_.context, id, payload + cursor, reportLen, tUs);
     }
@@ -298,7 +297,7 @@ void Sh2Client::handleReports(const uint8_t* payload, uint16_t len, uint32_t tUs
 }
 
 void Sh2Client::handleRotationVector(const uint8_t* report, uint8_t length,
-                                     uint32_t tUs) {
+                                     uint32_t tUs, int64_t referenceDeltaTicks) {
   sh2::RotationVector rv;
   if (!sh2::decodeRotationVector(report, length, rv)) {
     ++stats_.badResponses;
@@ -321,7 +320,7 @@ void Sh2Client::handleRotationVector(const uint8_t* report, uint8_t length,
   q.w = static_cast<float>(rv.real) * kQ14Scale;
   q.rawAccuracy = static_cast<int16_t>(rv.accuracyQ12);
   q.accuracy = accuracyFromStatus(rv.status);
-  q.tMeasUs = computeMeasTime(tUs, rv.delayTicks);
+  q.tMeasUs = computeMeasTime(tUs, rv.delayTicks, referenceDeltaTicks);
   q.tHostUs = tUs;
   q.seq = rv.sequence;
   q.epoch = static_cast<uint8_t>(epoch_);
@@ -374,10 +373,11 @@ void Sh2Client::handleRotationVector(const uint8_t* report, uint8_t length,
   }
 }
 
-uint32_t Sh2Client::computeMeasTime(uint32_t tEdgeUs, uint16_t delayTicks) const {
-  int64_t t = static_cast<int64_t>(tEdgeUs) + kTimebaseReferenceUs;
-  t += static_cast<int64_t>(delayTicks) * 100;
-  t += rebaseOffsetUs_;
+uint32_t Sh2Client::computeMeasTime(uint32_t tEdgeUs, uint16_t delayTicks,
+                                    int64_t referenceDeltaTicks) const {
+  // Reference sh2.c touSTimestamp(): (referenceDelta + delay) * 100 us.
+  int64_t t = static_cast<int64_t>(tEdgeUs) +
+              (referenceDeltaTicks + delayTicks) * kTimestampTickUs;
   if (t < 0) t = 0;
   return static_cast<uint32_t>(t);
 }
@@ -402,10 +402,9 @@ bool Sh2Client::setFeature(uint8_t reportId, uint32_t intervalUs, uint32_t nowUs
   uint8_t payload[sh2::kSetFeatureLen];
   for (uint8_t i = 0; i < sizeof(payload); ++i) payload[i] = 0;
 
-  const uint8_t sequence = nextCmdSeq_++;
   payload[0] = sh2::kSetFeatureCmd;
-  payload[1] = sequence;
-  payload[2] = 0x00;  // flags: no change sensitivity, no wake, no always-on
+  payload[1] = reportId;  // featureReportId (0x05 for Rotation Vector)
+  payload[2] = 0x00;      // flags: no change sensitivity, no wake, no always-on
   // changeSensitivity (3..4) = 0
   payload[5] = static_cast<uint8_t>(intervalUs & 0xFF);
   payload[6] = static_cast<uint8_t>((intervalUs >> 8) & 0xFF);
@@ -417,18 +416,18 @@ bool Sh2Client::setFeature(uint8_t reportId, uint32_t intervalUs, uint32_t nowUs
     return false;
   }
 
-  cmdPending_ = true;
-  cmdId_ = sh2::kSetFeatureCmd;
-  cmdSeq_ = sequence;
-  cmdDeadlineUs_ = nowUs + timeoutUs();
-  cmdState_ = CmdState::Pending;
+  // Reference sh2.c setSensorConfigStart(): the operation completes when
+  // sendCtrl returns; the set-feature command has no rx handler. The granted
+  // interval is validated by the following get-feature (0xFE/0xFC) exchange.
+  cmdState_ = CmdState::Ok;
+  cmdPending_ = false;
+  (void)nowUs;
 
   if (log_) {
     log_->log(LogLevel::Info, LogSh2, "s%u -> set feature 0x%02X @ %lu us", sensorId_,
               static_cast<unsigned>(reportId),
               static_cast<unsigned long>(intervalUs));
   }
-  (void)reportId;
   return true;
 }
 

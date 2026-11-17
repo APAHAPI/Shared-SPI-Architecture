@@ -98,6 +98,14 @@ std::vector<uint8_t> makeRotationVector(uint8_t sequence, int16_t i, int16_t j,
   return r;
 }
 
+// SH-2 timestamp report (0xFB base reference or 0xFA rebase, 5 bytes).
+std::vector<uint8_t> makeTimestampReport(uint8_t reportId, uint32_t ticks) {
+  std::vector<uint8_t> r(5, 0);
+  r[0] = reportId;
+  put32(r, 1, ticks);
+  return r;
+}
+
 std::vector<uint8_t> makeProductId(uint32_t partNumber, uint32_t buildNumber,
                                    uint16_t patch, uint8_t major, uint8_t minor) {
   std::vector<uint8_t> r(16, 0);
@@ -454,13 +462,27 @@ void testSh2SetFeatureBytes() {
   CHECK(frame[2] == 0x02);  // SH-2 control channel
   CHECK(frame[3] == 0x00);  // SHTP sequence
   CHECK(frame[4] == 0xFD);  // set feature
-  CHECK(frame[5] == 0x00);  // command sequence
+  CHECK(frame[5] == 0x05);  // featureReportId (was a command counter)
   CHECK(frame[6] == 0x00);  // flags
   CHECK(frame[9] == 0x60);  // 60000 = 0x0000EA60
   CHECK(frame[10] == 0xEA);
   CHECK(frame[11] == 0x00);
   CHECK(frame[12] == 0x00);
-  CHECK(fx.sh2.cmdState() == bno085::Sh2Client::CmdState::Pending);
+  CHECK(frame[17] == 0x00);  // sensorSpecific
+  CHECK(frame[18] == 0x00);
+  CHECK(frame[19] == 0x00);
+  CHECK(frame[20] == 0x00);
+
+  // Reference behaviour: completion is send success, not a 0xF1 response.
+  CHECK(fx.sh2.cmdState() == bno085::Sh2Client::CmdState::Ok);
+  CHECK(!fx.sh2.busy());
+
+  // A second request must not alter byte 1.
+  CHECK(fx.sh2.setFeature(0x05, 10000, 2000));
+  CHECK(fx.hal.sent.size() == 2);
+  CHECK(fx.hal.sent.back()[5] == 0x05);
+  CHECK(fx.hal.sent.back()[9] == 0x10);  // 10000 = 0x00002710
+  CHECK(fx.hal.sent.back()[10] == 0x27);
 }
 
 void testSh2RotationVectorDecode() {
@@ -499,6 +521,87 @@ void testSh2DelayField() {
   CHECK(fx.lastQuaternion.accuracy == bno085::Accuracy::Unreliable);
 }
 
+void testSh2BaseTimestampRef() {
+  Sh2Fixture fx;
+  std::vector<uint8_t> payload = makeTimestampReport(0xFB, 200);
+  const std::vector<uint8_t> rv =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  payload.insert(payload.end(), rv.begin(), rv.end());
+
+  fx.sh2.handlePayload(3, payload.data(), static_cast<uint16_t>(payload.size()),
+                       100000);
+  CHECK(fx.quaternionCalls == 1);
+  CHECK(fx.lastQuaternion.tMeasUs == 80000);  // 100000 - 200*100
+  CHECK(fx.sh2.stats().baseTimestampRefs == 1);
+  CHECK(fx.sh2.epoch() == 0);  // a base reference is not a discontinuity
+}
+
+void testSh2TimestampRebaseAdds() {
+  Sh2Fixture fx;
+  std::vector<uint8_t> payload = makeTimestampReport(0xFB, 200);
+  const std::vector<uint8_t> rebase = makeTimestampReport(0xFA, 50);
+  payload.insert(payload.end(), rebase.begin(), rebase.end());
+  const std::vector<uint8_t> first =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  const std::vector<uint8_t> second =
+      makeRotationVector(2, 0, 0, 0, 16384, 3, 0, 0);
+  payload.insert(payload.end(), first.begin(), first.end());
+  payload.insert(payload.end(), second.begin(), second.end());
+
+  fx.sh2.handlePayload(3, payload.data(), static_cast<uint16_t>(payload.size()),
+                       100000);
+  CHECK(fx.quaternionCalls == 2);
+  CHECK(fx.lastQuaternion.tMeasUs == 85000);  // -200 + 50 ticks
+  CHECK(fx.sh2.epoch() == 1);                 // rebase marks a discontinuity
+}
+
+void testSh2TimestampRebaseSigned() {
+  Sh2Fixture fx;
+  std::vector<uint8_t> payload = makeTimestampReport(0xFB, 200);
+  // 0xFFFFFFCE = -50 as int32.
+  const std::vector<uint8_t> rebase = makeTimestampReport(0xFA, 0xFFFFFFCEu);
+  payload.insert(payload.end(), rebase.begin(), rebase.end());
+  const std::vector<uint8_t> rv =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  payload.insert(payload.end(), rv.begin(), rv.end());
+
+  fx.sh2.handlePayload(3, payload.data(), static_cast<uint16_t>(payload.size()),
+                       100000);
+  CHECK(fx.quaternionCalls == 1);
+  CHECK(fx.lastQuaternion.tMeasUs == 75000);  // -200 - 50 ticks
+}
+
+void testSh2TimestampDeltaIsPerPayload() {
+  Sh2Fixture fx;
+  std::vector<uint8_t> firstPayload = makeTimestampReport(0xFB, 200);
+  const std::vector<uint8_t> firstReport =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  firstPayload.insert(firstPayload.end(), firstReport.begin(), firstReport.end());
+  fx.sh2.handlePayload(3, firstPayload.data(),
+                       static_cast<uint16_t>(firstPayload.size()), 100000);
+  CHECK(fx.lastQuaternion.tMeasUs == 80000);
+
+  // No reference in the next payload: fall back to the documented 12 ms default.
+  const std::vector<uint8_t> secondReport =
+      makeRotationVector(2, 0, 0, 0, 16384, 3, 0, 0);
+  fx.sh2.handlePayload(3, secondReport.data(),
+                       static_cast<uint16_t>(secondReport.size()), 200000);
+  CHECK(fx.lastQuaternion.tMeasUs == 188000);  // 200000 - 12000
+}
+
+void testSh2TimestampOnControlChannelIgnored() {
+  Sh2Fixture fx;
+  const std::vector<uint8_t> ref = makeTimestampReport(0xFB, 200);
+  fx.sh2.handlePayload(2, ref.data(), static_cast<uint16_t>(ref.size()), 100000);
+
+  const std::vector<uint8_t> rv =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  fx.sh2.handlePayload(3, rv.data(), static_cast<uint16_t>(rv.size()), 100000);
+  CHECK(fx.lastQuaternion.tMeasUs == 88000);  // unchanged 12 ms fallback
+  CHECK(fx.sh2.stats().baseTimestampRefs == 0);
+  CHECK(fx.sh2.epoch() == 0);
+}
+
 void testSh2DuplicateSuppression() {
   Sh2Fixture fx;
   const std::vector<uint8_t> report =
@@ -530,25 +633,30 @@ void testSh2UnknownReportStopsCleanly() {
   CHECK(fx.sh2.stats().unknownReports == 1);
 }
 
-void testSh2CommandTimeout() {
+void testSh2SetFeatureNoAckWait() {
   Sh2Fixture fx;
   fx.sh2.setTimeoutMs(100);
   CHECK(fx.sh2.setFeature(0x05, 10000, 1000));
-  CHECK(fx.sh2.busy());
-  fx.sh2.pollTimeouts(1000 + 100000);
   CHECK(!fx.sh2.busy());
-  CHECK(fx.sh2.cmdState() == bno085::Sh2Client::CmdState::Timeout);
-  CHECK(fx.sh2.stats().timeouts == 1);
-  CHECK(fx.sh2.lastError() == bno085::ErrorCode::Sh2Timeout);
+  CHECK(fx.sh2.cmdState() == bno085::Sh2Client::CmdState::Ok);
+
+  // The reference completes set-feature on send; a missing 0xF1 must not time out.
+  fx.sh2.pollTimeouts(1000 + 100000);
+  CHECK(fx.sh2.cmdState() == bno085::Sh2Client::CmdState::Ok);
+  CHECK(fx.sh2.stats().timeouts == 0);
+  CHECK(fx.sh2.lastError() == bno085::ErrorCode::None);
 }
 
-void testSh2HubRejection() {
+void testSh2LateSetFeatureAckIgnored() {
   Sh2Fixture fx;
   CHECK(fx.sh2.setFeature(0x05, 10000, 1000));
+
+  // A hub that does send 0xF1 must not fail the request or change the result.
   fx.hal.queuePacket(makePacket(2, 0, makeCommandResponse(0xFD, 0, 1)));
   CHECK(fx.shtp.service(2000) == bno085::ShtpResult::Ok);
-  CHECK(fx.sh2.cmdState() == bno085::Sh2Client::CmdState::HubError);
-  CHECK(fx.sh2.stats().badResponses == 1);
+  CHECK(fx.sh2.cmdState() == bno085::Sh2Client::CmdState::Ok);
+  CHECK(fx.sh2.stats().unexpectedResponses == 1);
+  CHECK(fx.sh2.stats().badResponses == 0);
 }
 
 void testSh2ResetComplete() {
@@ -577,11 +685,13 @@ void testSensorInitializationSequence() {
   fx.sensor.update();  // sends set-feature
   CHECK(fx.hal.sent.size() >= 2);
 
-  fx.hal.queuePacket(makePacket(2, 1, makeCommandResponse(0xFD, 0, 0)));
+  // No 0xF1 is queued: the reference completes set-feature on send, so the
+  // stage advances without an acknowledgement.
   fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Configuring);
 
   fx.sensor.update();  // sends get-feature
-  fx.hal.queuePacket(makePacket(2, 2, makeGetFeatureResponse(0x05, 10000)));
+  fx.hal.queuePacket(makePacket(2, 1, makeGetFeatureResponse(0x05, 10000)));
   fx.sensor.update();
   CHECK(fx.sensor.state() == bno085::State::Streaming);
   CHECK(fx.sensor.diagnostics().grantedIntervalUs == 10000);
@@ -690,8 +800,13 @@ int main() {
       {"sh2_duplicate_suppression", testSh2DuplicateSuppression},
       {"sh2_report_gap", testSh2ReportGap},
       {"sh2_unknown_report", testSh2UnknownReportStopsCleanly},
-      {"sh2_command_timeout", testSh2CommandTimeout},
-      {"sh2_hub_rejection", testSh2HubRejection},
+      {"sh2_set_feature_no_ack_wait", testSh2SetFeatureNoAckWait},
+      {"sh2_late_ack_ignored", testSh2LateSetFeatureAckIgnored},
+      {"sh2_base_timestamp_ref", testSh2BaseTimestampRef},
+      {"sh2_timestamp_rebase", testSh2TimestampRebaseAdds},
+      {"sh2_timestamp_rebase_signed", testSh2TimestampRebaseSigned},
+      {"sh2_timestamp_per_payload", testSh2TimestampDeltaIsPerPayload},
+      {"sh2_timestamp_control_ignored", testSh2TimestampOnControlChannelIgnored},
       {"sh2_reset_complete", testSh2ResetComplete},
       {"sensor_init_sequence", testSensorInitializationSequence},
       {"sensor_boot_timeout", testSensorBootTimeout},
