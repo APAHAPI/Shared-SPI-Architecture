@@ -977,6 +977,23 @@ observability. Each step is independently testable.
 
 ## 13. Implementation pass (pass 3) — P1–P3 applied
 
+### 13.0 Answers to the eight verification questions
+
+> This is a summary of work performed earlier in the same session (code/test commit `25deebf`,
+> document commit `5b0034f`). It is **not** a new verification pass: no source, test or build was
+> re-run to produce this table. §13.1–§13.6 hold the evidence.
+
+| # | Question | Answer |
+| --- | --- | --- |
+| 1 | Was the set-feature payload verified against the authoritative SH-2 implementation? | **Yes.** Compared with the CEVA/Hillcrest `sh2.c` definitions `SetFeatureReport_t`, `setSensorConfigStart` and `setSensorConfigOp`. |
+| 2 | Were the timestamp report IDs and channel handling verified? | **Yes.** Checked `SENSORHUB_BASE_TIMESTAMP_REF` (0xFB), `SENSORHUB_TIMESTAMP_REBASE` (0xFA), `sensorhubInputHdlr` and `touSTimestamp`. |
+| 3 | Which defects were confirmed? | **Three.** P1: byte 1 carried a counter instead of the feature report ID. P2: completion depended on an ack the reference does not require (code divergence certain; this hub's ack behaviour still unproven). P3: IDs transposed, handled on the wrong channel, and accumulated into a persistent offset. P4–P6 were not repaired. |
+| 4 | Which source files were modified? | `src/sh2/Sh2Client.cpp`, `src/sh2/Sh2Client.h`, `src/sh2/Sh2Codes.h` and `test/native/test_main.cpp`; changes per file in §13.6. |
+| 5 | Which regression tests were added? | New: `sh2_set_feature_no_ack_wait`, `sh2_late_ack_ignored`, `sh2_base_timestamp_ref`, `sh2_timestamp_rebase`, `sh2_timestamp_rebase_signed`, `sh2_timestamp_per_payload`, `sh2_timestamp_control_ignored`. Re-baselined: `sh2_set_feature_bytes`; `sensor_init_sequence` no longer waits for an `0xFD` ack. |
+| 6 | Latest native test results? | **35 cases / 194 checks, 0 failures, `RESULT: PASS`** (MSVC 2022, `test\native\build_msvc.bat`; `build\native_tests.log`). |
+| 7 | Does the ESP32-S3 build still succeed? | **Yes.** exit 0, 0 warnings, 0 errors; 324 210 B flash (24%), 23 880 B RAM (7%) on ESP32 core 3.3.12 (`build\esp32s3_final.log`). |
+| 8 | Latest commit hash at the time of that work? | Code and tests `25deebf`; documentation `5b0034f`. This summary is committed locally on top of them and was not pushed. |
+
 **Scope.** Only the two highest-priority protocol defects from §12.7 were changed: **P1/P2**
 (set-feature payload and completion) and **P3** (timestamp reference/rebase). **P4** (INT polling),
 **P5** (recovery) and **P6** (output loss) were deliberately left untouched. There is no Phase 2
