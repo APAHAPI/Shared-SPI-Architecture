@@ -5,6 +5,7 @@
 // golden vectors, not captures from a physical device.
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -17,6 +18,7 @@
 #include "sh2/Sh2Reports.h"
 #include "shtp/ShtpTransport.h"
 #include "util/Crc16.h"
+#include "util/TimeDelta.h"
 
 #include "mock_hal.h"
 
@@ -650,6 +652,45 @@ void testSh2TimestampBeforeZeroWraps() {
   CHECK(fx.lastQuaternion.tMeasUs == 0xFFFFB5C8u);
 }
 
+// ---------------------------------------------------------------------------
+// Example diagnostic: signed host-minus-measurement difference
+// ---------------------------------------------------------------------------
+void testTimeDeltaPositive() {
+  // A normal report: the measurement instant precedes the host observation.
+  CHECK(bno085::timeDeltaUs(1003000u, 1000000u) == 3000);
+  CHECK(bno085::timeDeltaUs(1u, 0u) == 1);
+}
+
+void testTimeDeltaZero() {
+  CHECK(bno085::timeDeltaUs(0u, 0u) == 0);
+  CHECK(bno085::timeDeltaUs(0xDEADBEEFu, 0xDEADBEEFu) == 0);
+}
+
+void testTimeDeltaNegative() {
+  // tMeas later than tHost must stay negative, never wrap to a huge latency.
+  CHECK(bno085::timeDeltaUs(1000u, 1200u) == -200);
+  CHECK(bno085::timeDeltaUs(0u, 1u) == -1);
+}
+
+void testTimeDeltaRollover() {
+  // 32-bit micros() wrap: 0xFFFFFFF0 -> 0x00000032 is 66 us forward.
+  CHECK(bno085::timeDeltaUs(50u, 0xFFFFFFF0u) == 66);
+  CHECK(bno085::timeDeltaUs(0xFFFFFFF0u, 50u) == -66);
+  CHECK(bno085::timeDeltaUs(0u, 0xFFFFFFFFu) == 1);
+  CHECK(bno085::timeDeltaUs(0xFFFFFFFFu, 0u) == -1);
+}
+
+void testTimeDeltaBoundary() {
+  // Largest exactly representable difference.
+  CHECK(bno085::timeDeltaUs(0x7FFFFFFFu, 0u) == INT32_MAX);
+  CHECK(bno085::timeDeltaUs(0u, 0x7FFFFFFFu) == -INT32_MAX);
+  // Exactly half the counter range: the documented ambiguity limit.
+  CHECK(bno085::timeDeltaUs(0u, 0x80000000u) == INT32_MIN);
+  CHECK(bno085::timeDeltaUs(0x80000000u, 0u) == INT32_MIN);
+  CHECK(bno085::timeDeltaUs(0x80000001u, 0u) == INT32_MIN + 1);
+  CHECK(bno085::timeDeltaUs(0x7FFFFFFFu, 0xFFFFFFFFu) == INT32_MIN);
+}
+
 void testSh2DuplicateSuppression() {
   Sh2Fixture fx;
   const std::vector<uint8_t> report =
@@ -859,6 +900,11 @@ int main() {
       {"sh2_timestamp_no_reference", testSh2TimestampNoReferenceStartsAtZero},
       {"sh2_timestamp_host_wrap", testSh2TimestampWrapsWithHostCounter},
       {"sh2_timestamp_before_zero", testSh2TimestampBeforeZeroWraps},
+      {"time_delta_positive", testTimeDeltaPositive},
+      {"time_delta_zero", testTimeDeltaZero},
+      {"time_delta_negative", testTimeDeltaNegative},
+      {"time_delta_rollover", testTimeDeltaRollover},
+      {"time_delta_boundary", testTimeDeltaBoundary},
       {"sh2_reset_complete", testSh2ResetComplete},
       {"sensor_init_sequence", testSensorInitializationSequence},
       {"sensor_boot_timeout", testSensorBootTimeout},

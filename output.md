@@ -28,6 +28,12 @@ from the current tree), *host-tested* (executed in this audit), *historical* (re
 repository before this audit, not re-executed), or *unverified* (requires hardware or a
 toolchain that is not present).
 
+> **Pass 5 update (2026-11-19, later).** HEAD is now `5b96597` ("Update output.md").
+> Sections 1–12 below are the Pass 4 audit taken at `e9a41ec`; its source-behaviour
+> findings still apply. Pass 5A changes are **uncommitted** in the working tree.
+> Pass 5B–5D are investigations only, with no implementation. See §13 onward.
+> Hardware is still disconnected; nothing in Pass 5 is physical validation.
+
 ---
 
 ## 1. Verdict summary
@@ -619,3 +625,502 @@ accompanies this file; at the time of writing the only expected change is:
 ```
 modified: output.md
 ```
+
+---
+
+## 13. Pass 5A — timestamp diagnostic (implemented, host-tested)
+
+### 13.1 What the diagnostic computes
+
+The example prints `dt=` for each Rotation Vector:
+
+- `tHostUs` = host `micros()` captured when `Sensor::serviceBus` first observes INT
+  asserted (`BNO085Sensor.cpp:165–174`), reused for every packet drained in that visit.
+  It is **poll-observation time**, not the ISR edge time (see §16).
+- `tMeasUs` = `tEdge + (referenceDeltaTicks + delayTicks) * 100`
+  (`Sh2Client.cpp:377–385`) — the hub's estimated measurement instant.
+
+`dt = tHostUs - tMeasUs` is the interval between the hub's estimate of when the sample was
+taken and when the host noticed the interrupt. It is a transport/scheduling figure: it
+includes the hub delay-field compensation, SPI transfer time, loop latency and any
+printing/logging time. It is not sensor latency, and it is not a pure INT-to-read latency.
+
+Before Pass 5A the subtraction was unsigned:
+
+```cpp
+static_cast<unsigned long>(q.tHostUs - q.tMeasUs)
+```
+
+If `tMeasUs > tHostUs` (possible whenever the reference delta is positive, or across a
+counter wrap), this printed ~4.29e9 as a "latency". It did not affect `tMeasUs` storage or
+the binary frame.
+
+### 13.2 Fix
+
+New header-only helper `src/util/TimeDelta.h`:
+
+```cpp
+inline int32_t timeDeltaUs(uint32_t a, uint32_t b);
+```
+
+- computes `a - b` with modular 32-bit semantics;
+- returns a signed value; positive = `a` later, negative = `a` earlier;
+- valid while the readings are < 2^31 µs apart (~35.8 min); exactly half-range is
+  documented as ambiguous;
+- uses an `int64_t` intermediate and an explicit fold, so there is no
+  implementation-defined unsigned-to-signed conversion.
+
+The example now does (`examples/01_SingleSensor/01_SingleSensor.ino:175–184`):
+
+```cpp
+const int32_t dtUs = bno085::timeDeltaUs(q.tHostUs, q.tMeasUs);
+Serial.printf("... tMeas=%lu dt=%ldus%s\n", /* ... */,
+              static_cast<unsigned long>(q.tMeasUs),
+              static_cast<long>(dtUs),
+              (dtUs < 0) ? " (tMeas ahead of tHost)" : "");
+```
+
+and documents the meaning, the polling limitation, negative values and the rollover limit
+in the sketch header (`:18–29`). `BNO085Multi.h` includes the helper so sketches can call
+`bno085::timeDeltaUs`.
+
+Not changed: `Sh2Client::computeMeasTime`, `Quaternion::tMeasUs`, `tHostUs`, the binary
+QUATERNION payload, or the `0xFB`/`0xFA` handling. The investigation found no defect in the
+reconstruction itself; only the display arithmetic was wrong.
+
+### 13.3 Tests and results
+
+`test/native/test_main.cpp` adds `#include "util/TimeDelta.h"` and five cases:
+
+| Case | Checks |
+| --- | --- |
+| `time_delta_positive` | 1 003 000 − 1 000 000 = 3000; 1 − 0 = 1 |
+| `time_delta_zero` | 0 − 0; equal large values |
+| `time_delta_negative` | 1000 − 1200 = −200; 0 − 1 = −1 |
+| `time_delta_rollover` | 50 − 0xFFFFFFF0 = 66; reverse = −66; 0 − 0xFFFFFFFF = 1; reverse = −1 |
+| `time_delta_boundary` | ±INT32_MAX; half-range → INT32_MIN; INT32_MIN+1; 0x7FFFFFFF−0xFFFFFFFF = INT32_MIN |
+
+Commands executed in this pass:
+
+```
+cmd /c "test\native\build_msvc.bat"
+→ BNO085Multi host tests (44 cases)
+→ 201 checks, 0 failures
+→ RESULT: PASS   (exit 0)
+```
+
+```
+.\.tools\arduino-cli.exe compile --fqbn esp32:esp32:esp32s3 --library . ^
+    --output-dir build\esp32s3_pass5 examples\01_SingleSensor
+→ Sketch uses 324262 bytes (24%) of program storage space.
+→ Global variables use 23880 bytes (7%) of dynamic memory.
+→ exit 0
+```
+
+The first tooling attempt used `--libraries .`, which made the CLI treat `src/` as a
+library named `src`; the link failed with undefined references. The correct flag for one
+library root is `--library .`. The successful log is `build/esp32s3_pass5.log`; `build/` is
+git-ignored. Compile size is 88 B above the README's historical 324 174 B; static RAM is
+unchanged. This is a compile result, not a hardware run.
+
+### 13.4 Remaining diagnostic limitations
+
+- `tHostUs` is still poll-observation time, so `dt` includes loop latency (§16).
+- `dt` mixes hub delay compensation with host latency. `Quaternion::delayTicks` is exposed
+  if a host wants to separate the known part.
+- The value is only meaningful if the hub's `0xFB` base is aligned with host time; a
+  misaligned base appears as a constant or drifting offset.
+- No hardware measurement of the real `dt` distribution exists.
+
+---
+
+## 14. Pass 5B — binary output reliability (investigation only, NOT implemented)
+
+### 14.1 Actual path
+
+```
+Sensor::update()                                  BNO085Sensor.cpp:139
+  serviceBus()                                    :153 / :165
+    shtp_.service(intEdgeUs_)                     :189
+      ShtpTransport assembles a payload           ShtpTransport.cpp:221–278
+        handler_ → Sensor::onChannel              :274–277 / :421
+          sh2_.handlePayload → quaternion handler
+            Sensor::onQuaternion                  BNO085Sensor.cpp:426
+              encoder_.writeQuaternion            :442
+                BinaryEncoder::emit               BinaryEncoder.cpp:25
+                  sink_->write(frame, total)      :53
+                    StreamSink::write             ArduinoSink.h:18–20
+                      HardwareSerial::write       core 3.3.12
+```
+
+The output write is synchronous and runs **inside the SHTP service callback**, before the
+rest of the current INT visit has been drained. The service budget
+(`ManagerConfig::serviceBudgetUs`, checked at `BNO085Sensor.cpp:216` only after each
+transfer) cannot interrupt a blocked `write`.
+
+HELLO, INIT_RESULT, ERROR and SENSOR_STATUS are emitted from
+`begin`/`advanceInit`/`checkSilence`/`emitStatusIfDue`, i.e. outside `serviceBus` but still
+inside the `update()` path.
+
+### 14.2 What the sink actually guarantees
+
+`StreamSink::write` returns `stream_.write(data, len)`. In the installed Arduino-ESP32 core
+3.3.12:
+
+```cpp
+size_t HardwareSerial::write(const uint8_t *buffer, size_t size) {
+  uartWriteBuf(_uart, buffer, size);
+  return size;               // unconditional
+}
+```
+
+`uartWriteBuf` calls `uart_write_bytes` and ignores its return value. On the `Serial` used
+by this sketch (`ARDUINO_USB_CDC_ON_BOOT=0`, so hardware UART0):
+
+- A short write is **never reported**; `write` returns `len` even when `_uart == NULL`.
+- A zero-byte or failed transmission is **never reported**.
+- `BinaryEncoder`'s `written != total` branch is effectively unreachable for this backend.
+- `uart_write_bytes` blocks while the TX ring buffer is full. With no flow control the UART
+  drains continuously, so the block is bounded by the frame size at the current baud; it is
+  not bounded by a timeout.
+- Switching to USB CDC (`ARDUINO_USB_CDC_ON_BOOT=1`) would change this: `USBCDC::write` has
+  its own timeout/blocking behaviour and needs separate verification.
+
+Frames are 34 bytes (QUATERNION: 8 header + 24 payload + 2 CRC). At 115200 8N1 that is
+~3.0 ms if the ring is full; the default service budget is 2 ms. Text output is heavier: a
+line of ~100 bytes is ~8.7 ms, so the text example can spend most of a 10 ms report
+interval printing and delay INT observation.
+
+### 14.3 Counter semantics today
+
+`BinaryEncoder` has three counters (`BinaryEncoder.h:24–25, 43–44`):
+
+| Counter | Incremented when | Problem |
+| --- | --- | --- |
+| `frames_` (`framesWritten`) | `sink_->write` returned `total` | Not exposed by `Sensor` |
+| `dropped_` (`framesDropped`) | sink is `nullptr`; payload too large; short write | Conflates three different events; unused outside the encoder |
+| `sequence_` | before the write attempt (`BinaryEncoder.cpp:43`) | Consumed even when the frame is dropped; the consumer sees a gap but cannot tell why |
+
+When `emitBinaryFrames` is false, `begin()` attaches `nullptr` (`BNO085Sensor.cpp:56`), but
+HELLO, INIT_RESULT, ERROR and STATUS are still emitted unconditionally. Those intentional
+suppressions increment `dropped_`, so `dropped_` currently means "write not performed", not
+"data lost". No `Diagnostics` field carries frame counts, no error frame is generated on
+loss, and `framesDropped()` has no caller.
+
+### 14.4 Answers to the specific questions
+
+- **Partial writes:** possible at the `IOutputSink` contract level, but not observable
+  through `HardwareSerial`; if a sink did write a prefix and return short, the encoder would
+  count a drop after corrupting the byte stream.
+- **Zero-byte writes:** not reported; `HardwareSerial` returns `size` regardless.
+- **Failed writes:** not reported; same reason.
+- **Buffer exhaustion:** manifests as blocking inside `uart_write_bytes`, not as a return
+  value.
+- **Frame loss:** silent; only a sequence gap in the consumer hints at it.
+- **Can the application observe failures?** No. `Sensor` ignores every `write*` return and
+  `Diagnostics` has no counter.
+- **Can output block sensor servicing?** Yes. The write is inside `serviceBus`, and the
+  2 ms budget is checked only after each transfer. A full UART ring adds the frame drain
+  time; text logging (`StreamLogSink::println`) adds more. The block is bounded per frame,
+  but it can exceed the budget and delay the next INT observation.
+- **Intentional suppression vs drop vs failure:** currently all three collapse into
+  `dropped_`.
+
+### 14.5 Minimal proposed design (for review; not implemented)
+
+Goal: every byte that is not delivered is classified and countable, with no queue and no
+new blocking.
+
+1. **Make the sink honest and atomic.** `StreamSink::write` checks
+   `stream_.availableForWrite()` first; if the whole frame does not fit, return 0 without
+   writing. This never blocks and never emits a partial frame. Keep
+   `IOutputSink::write` semantics: "returns bytes accepted; a value other than `len` means
+   the frame was not emitted". `HardwareSerial` implements `availableForWrite()` (TX ring
+   free space); frames (<= 34 B) fit the default 256 B ring.
+2. **Separate the three outcomes.** `suppressed_`: no sink or binary output intentionally
+   off. `dropped_`: a real frame could not be written. `frames_`: delivered. Keep
+   `sequence_` advancing for real attempted frames (including drops) so a gap still signals
+   loss; do **not** advance it for suppressed frames.
+3. **Stop counting suppression as loss.** Either guard every encoder call with
+   `manager_.emitBinaryFrames` (HELLO/INIT/ERROR/STATUS as well as QUATERNION), or attach a
+   `NullOutputSink` and have `emit` treat it as suppressed. The guard is simpler.
+4. **Surface the loss.** Add `framesDropped` to `Diagnostics` (mirrored on emit) and to
+   `SENSOR_STATUS` (use the reserved byte or extend the payload; version and document it).
+   Emit one `ERROR(OutputOverflow)` on the first drop in a window, rate-limited (e.g. once
+   per second), with `context` = drop count. Do not retry the failed frame. Optionally add a
+   `HELLO` capability bit so a host knows the counter is valid.
+5. **Bound the work.** One frame per call, no queue, drop-newest when the sink is full. A
+   2-frame queue would only move the loss and add latency; not recommended.
+6. **Document** that `dropped_` is a real-loss counter, frames are atomic, and the UART ring
+   is the only buffer.
+
+### 14.6 Proposed regression tests
+
+Host-simulatable (new `MockSink` with settable capacity):
+
+1. Capacity exactly `len` → delivered, `framesWritten == 1`.
+2. Capacity `len - 1` → `framesDropped == 1`, `framesWritten == 0`, sink byte stream empty
+   (no partial prefix).
+3. `emitBinaryFrames == false` → suppressed increments, dropped stays 0.
+4. A real drop → the next successful frame carries sequence +2 (consumer-visible gap).
+5. Status frame reports the drop count.
+6. Repeated drops → at most one ERROR frame per rate-limit window.
+7. A drop does not stop the next report from decoding.
+8. The sink is never asked for more than it can accept in one call.
+
+Hardware-only: actual `availableForWrite()` ring behaviour with a stalled USB host; whether
+UART ever blocks at 115200/100 Hz; USB CDC timeout/partial/unplug behaviour; real drop
+counts with a deliberately slow consumer.
+
+---
+
+## 15. Pass 5C — automatic recovery (investigation only, NOT implemented)
+
+### 15.1 Every transition into `Failed`
+
+| # | Trigger | Code | Error code | Recoverable today? |
+| --- | --- | --- | --- | --- |
+| 1 | HAL begin fails | `BNO085Sensor.cpp:70–79` | `InvalidConfig` | No — `started_` stays false |
+| 2 | Boot deadline (300 ms) | `:235–237` | `BootTimeout` | Manual only |
+| 3 | Identify deadline (100 ms) | `:250–251` | `Sh2Timeout` | Manual only |
+| 4 | Set-feature stage deadline | `:279–281` | `Sh2Timeout` | Manual only |
+| 5 | Set-feature `HubError`/`Timeout` | `:271–274` | `Sh2BadResponse`/`Sh2Timeout` | Unreachable (send completes immediately) |
+| 6 | Get-feature `HubError`/`Timeout` | `:292–294` | `Sh2BadResponse` | Manual only |
+| 7 | Get-feature deadline | `:295–297` | `Sh2Timeout` | Manual only |
+| 8 | `recover()` with budget exhausted | `:373–375` | `BootTimeout` (misleading) | Terminal |
+
+Not transitions to `Failed` today:
+
+- SPI transfer failure → `setError(SpiRead)` only (`:203–206`), state unchanged.
+- Malformed/oversize SHTP → `setError(ShtpBadFrame)` only (`:207–213`).
+- Silence → `Degraded` + `NoReports` (`:329–346`), self-clears on the next report
+  (`:434–439`).
+
+A permanently broken bus or a device that never reports again does not fail; it either
+retries forever with only a counter or sits in `Degraded`.
+
+### 15.2 Answers
+
+- **Which errors trigger recovery?** None automatically. Only the example's `r` key calls
+  `recover()`.
+- **Which require manual intervention?** Every `Failed` state, plus the permanent-bus and
+  permanent-silence cases.
+- **Recovery while the bus is unavailable?** `recover()` does not touch SPI; it schedules
+  `startBoot()`. `startBoot()` calls `pulseReset()` (blocking `delay(1)` plus
+  `digitalWrite`) and, when `resetPin < 0` and `recovering_`, `sh2_.sendReset()` through the
+  bus. A broken bus fails at the boot deadline; it is bounded.
+- **Are reset and init deadlines bounded?** Yes: `bootTimeoutMs` 300 ms and
+  `commandTimeoutMs` 100 ms per stage. Identify resends every 10 ms until its deadline;
+  Get-feature sends once and waits for its deadline. No unbounded loop.
+- **Backoff:** `backoffForAttempt(1..5)` = 250, 500, 1000, 2000, 4000 ms, clamped later.
+  `recover()` increments first, so attempt 1 waits 250 ms; `update()` in `Recovering` calls
+  `startBoot()` when `retryAtUs_` is reached.
+- **Starvation:** with one sensor, `Recovering` costs one `update()` call and a 1 ms reset
+  delay when the deadline fires. It does not starve the loop. In Phase 2, several sensors
+  resetting together would add up; the manager will need staggered or non-blocking resets.
+- **Diagnostics counts:** `resetPulses` counts reset pulses and `resets` counts
+  reset-complete messages, but attempts, successes, terminal state and last-recovery reason
+  are not stored. `recover()` logs the attempt number only. `diag_.lastError` can be
+  overwritten by later transient errors.
+
+### 15.3 Proposed fault-recovery FSM (for review; not implemented)
+
+```
+Streaming ──fault──> (classify)
+   │                   ├─ fatal config ──────────────> Failed(terminal)
+   │                   ├─ transient (< N in window) ─> stay, count
+   │                   └─ recoverable ───────────────> Recovering(backoff)
+   │                                                        │
+   │                                                        v
+   │                                                     Booting
+   │                                                        │
+   │                                                        v
+   │                                     Identifying -> Configuring
+   │                                                        │
+   └──────────────── Streaming (success: attempts = 0) <────┘
+                                                             │
+                              attempts >= max ───────────────┴──> Failed(terminal)
+```
+
+Rules:
+
+1. **Classification.** `InvalidConfig`/`UnsupportedReport` are fatal. `BootTimeout`,
+   `Sh2Timeout`, `Sh2BadResponse` are recoverable. `SpiRead`/`ShtpBadFrame`/`NoReports` are
+   transient until N occur in a window, then recoverable.
+2. **Bounded attempts.** `RecoveryPolicy::maxAttempts` (default 5) with the existing backoff
+   table. Increment only when a recovery is actually scheduled.
+3. **Success resets.** `enterStreaming()` sets `attempts = 0`, `successes++`,
+   `terminal = false`. `enterStreaming()` already resets attempts; keep that.
+4. **Terminal failure.** After `maxAttempts` consecutive recoveries without reaching
+   `Streaming`, enter `Failed` with `terminal = true` and the actual reason. `update()`
+   stays a no-op. Do not rewrite the cause as `BootTimeout`.
+5. **Manual override.** `recover()` from terminal resets the budget and schedules an
+   immediate attempt, but rate-limit manual calls (e.g. one per second) so an application
+   loop cannot thrash the device. Document it as an operator action.
+6. **No recovery in `begin()` failure.** A HAL/configuration failure is fatal; return it
+   and stay `Unconfigured`.
+7. **Bus-unavailable handling.** Do not pulse reset while the last K bus transfers failed.
+   Either probe a cheap transfer first or count the attempt and let the boot deadline
+   govern. Keep the reset pulse non-blocking or accept the bounded 1 ms delay explicitly.
+8. **Diagnostics.** Add `recoveryAttempts`, `recoverySuccesses`, `recoveryFatal`,
+   `lastRecoveryReason`; emit an `INIT_RESULT`/status frame on each attempt and on the
+   terminal transition (ARCHITECTURE already promises this).
+
+### 15.4 Proposed tests
+
+Host-simulatable (MockHal clock + `failTransfers`):
+
+1. Bus error during streaming triggers recovery after the configured threshold.
+2. Deadline failure in each init stage schedules recovery, not immediate `Failed`.
+3. Backoff schedule is exactly 250/500/1000/2000/4000 ms.
+4. Exhaustion enters terminal `Failed` with the real error code and stops servicing.
+5. A successful recovery resets the attempt counter.
+6. Manual `recover()` from terminal resets the budget; a second call inside the rate-limit
+   window is ignored.
+7. Config/HAL begin failure stays terminal and never schedules recovery.
+8. Silence beyond the window triggers recovery (or explicitly does not, if the policy is
+   "degrade only").
+9. `update()` during `Recovering` stays under the documented budget (mock clock measures the
+   reset delay).
+10. `resetPulses`/`resets`/attempt counters match the number of transitions.
+
+Hardware-only: real NRST timing and device boot time; software reset over SHTP with no
+reset pin; recovery after physically disconnecting MISO/INT; repeated cold boots and soak.
+
+---
+
+## 16. Pass 5D — INT handling and timestamp semantics (investigation only)
+
+### 16.1 Current behaviour
+
+`Esp32SpiHal::intAsserted()` is `digitalRead(intPin) == LOW` (`Esp32SpiHal.cpp:91–95`);
+there is no `attachInterrupt`. `Sensor::serviceBus` samples it once per `update()` and
+latches `intEdgeUs_ = nowUs` on the first asserted observation (`BNO085Sensor.cpp:165–180`).
+All packets drained in that visit share that timestamp (`:189`). `Quaternion::tHostUs`
+therefore means "host time when the loop noticed INT", not "hardware INT assertion time".
+`BNO085Types.h:141` still says "host time at INT assertion"; that comment is inaccurate.
+
+### 16.2 Option comparison
+
+| Criterion | A: keep polling, define observation time | B: ISR captures edge time + pending flag |
+| --- | --- | --- |
+| Timestamp accuracy | Error = physical edge to next `update()`; up to one loop period. At 100 Hz with binary output a few ms; with per-report text printing it can approach or exceed 10 ms. | Error = ISR entry latency (µs on ESP32-S3), independent of loop load. |
+| Interrupt behaviour | No ISR. INT is level; the loop drains up to `maxTransfersPerVisit` per visit. | `FALLING` edge only. The device holds INT low until serviced, so one edge covers all pending transfers. A partial drain produces no new edge. |
+| Concurrency / atomicity | None; single-threaded. | ISR writes a 32-bit stamp and a pending flag while the loop reads/clears them. Needs a critical section or sequence counter; 32-bit aligned writes are atomic on Xtensa, but the pair still needs ordering. |
+| Missed / coalesced events | A slow loop coalesces reports in the INT window into one observation; multiple pulses between updates collapse. | Same protocol-level coalescing; the ISR at least records the first edge. A second edge while pending is lost unless counted. |
+| ESP32-S3 complexity | Low; already portable and mockable. | Medium: `attachInterrupt`, IRAM-safe handler, detach in `end()`, `volatile`/atomic state, portable `IHal` hook, mock support. |
+| Testability | Deterministic in `MockHal` (set `intState`, advance clock). | Needs mock ISR injection; races are harder to cover. |
+| Future multi-sensor | Poll latency grows with sensor count and bus time; per-sensor stamps become less comparable. | Per-pin stamps stay comparable; the manager still schedules service, so stamp accuracy is preserved. |
+
+### 16.3 Recommendation
+
+**Option A for Phase 1.** The requirement is a single-sensor baseline; `tHostUs` currently
+feeds (a) the `dt` diagnostic and (b) silence detection (`lastReportUs_`). Neither needs
+sub-millisecond accuracy. `tMeasUs` reconstruction uses `tHostUs` only as the edge anchor,
+and the 100 µs tick already dominates. Polling is deterministic, portable and covered by the
+mock.
+
+Adopt Option B when at least one of these becomes true:
+
+- timestamps feed fusion/filtering with a sub-millisecond error budget;
+- multi-sensor scheduling makes poll latency comparable to the report interval;
+- the text example remains the primary output and its print time cannot be bounded.
+
+Cheap interim measures under A: keep per-report printing out of the hot path when timestamps
+matter, document `tHostUs` as observation time everywhere, and use the exposed
+`Quaternion::delayTicks` to separate hub compensation from host latency.
+
+### 16.4 Proposed tests
+
+Host-simulatable under A:
+
+1. `tHostUs` equals the mock clock at the first asserted observation.
+2. All packets drained in one visit share that stamp.
+3. A visit with INT low does not change the stamp.
+4. Silence detection uses the observation stamp (existing behaviour).
+
+Under B (future): ISR stamp earlier than the loop observation by a controlled mock delay;
+pending flag not lost when the edge arrives between read and clear; `end()` detaches the
+interrupt (no callback after teardown); coalesced edges increment a missed-edge counter.
+
+Hardware-only in both cases: actual INT-to-first-SPI time measured with a scope/logic
+analyser; whether the BNO085 deasserts INT between reports at 100 Hz; behaviour with a
+shared bus and multiple sensors.
+
+---
+
+## 17. Confirmed defects versus design recommendations
+
+Confirmed defects in the current tree (source-verified, no hardware required):
+
+| # | Defect | Evidence |
+| --- | --- | --- |
+| C1 | The example printed an unsigned timestamp difference, so a negative `dt` became ~4.29e9 | Fixed in Pass 5A |
+| C2 | `HardwareSerial::write` returns `size` unconditionally, so the encoder's short-write detection cannot fire on the Arduino backend | core 3.3.12 `HardwareSerial.cpp`; `ArduinoSink.h:18–19` |
+| C3 | `dropped_` conflates intentional suppression, oversize payload and failed write | `BinaryEncoder.cpp:27–36, 54–61`; null sink at `BNO085Sensor.cpp:56` |
+| C4 | Output loss is not exposed; `framesDropped()` has no caller and no `Diagnostics` field | grep of `src/`, `examples/` |
+| C5 | Every `Failed` state is terminal; `update()` returns immediately and nothing calls `recover()` automatically | `BNO085Sensor.cpp:141–144, 369–394` |
+| C6 | `recover()` does not reset the attempt budget; only `begin()` and `enterStreaming()` do | `:82, :314, :369–394` |
+| C7 | Exhausted recovery reports the wrong cause (`BootTimeout`) | `:373–375` |
+| C8 | Permanent bus failure never reaches `Failed`; it only increments error counters | `:203–213` |
+| C9 | `tHostUs` is poll-observation time while the type comment and docs say INT assertion time | `Esp32SpiHal.cpp:91–95`; `BNO085Types.h:141` |
+| C10 | `Diagnostics::product`, `csTransactions`, `spiTransfers`, `busTimeouts`, `transferBytes` are never written | prior audit, still true |
+| C11 | Normal two-fragment reassembly has no positive host test; only rejection/oversize are covered | registry §9 |
+
+Design recommendations (not defects, pending approval):
+
+- Atomic, non-blocking `StreamSink` with an `availableForWrite()` pre-check (5B).
+- Separate suppressed/dropped/written counters and a rate-limited overflow error (5B).
+- Bounded automatic recovery FSM with a terminal state and attempt diagnostics (5C).
+- Keep INT polling for Phase 1 and standardise the "observation time" wording (5D).
+
+---
+
+## 18. Remaining hardware validation
+
+Nothing in Pass 5 is hardware evidence. Still unmeasured:
+
+- Product ID and the 4/5-entry product-ID forms on a real device.
+- Set-feature acceptance, including whether the hub sends `0xF1` for `0xFD`.
+- Get-feature granted interval.
+- Rotation Vector decode and timestamp reconstruction on a real stream; distribution of
+  `dt`.
+- INT-to-service latency with the actual loop and output mode.
+- UART backpressure / frame loss at 115200, and the USB CDC variant.
+- Recovery with a wired NRST, and software reset over SHTP with `resetPin = -1`.
+- The 10-minute soak, disconnected-INT timeout, 30 cold boots, and the Adafruit comparison.
+- Bus behaviour with the BNO085 disconnected (MISO floating) on a real board.
+
+---
+
+## 19. Recommended next development step
+
+1. Review and commit Pass 5A (helper + example + tests) before touching the output path.
+2. Implement the 5B minimal design next: honest atomic sink, suppressed/dropped separation,
+   `framesDropped` in diagnostics/status, one rate-limited overflow error. It is the
+   smallest change that removes silent loss and is fully host-testable.
+3. Then implement the 5C FSM behind a configuration switch (automatic recovery off by
+   default until hardware is available), with the host tests in §15.4.
+4. Treat 5D as a documentation decision first: standardise on "observation time". Add the
+   ISR only if the timestamp error budget or Phase 2 scheduling demands it.
+5. After any change, re-run the host suite and the ESP32-S3 compile; do not mark any stage
+   physically validated until the board is reconnected.
+
+---
+
+## 20. Pass 5 working-tree checkpoint
+
+At the end of this pass (uncommitted, not staged):
+
+| File | Status | Change |
+| --- | --- | --- |
+| `src/util/TimeDelta.h` | new | rollover-safe signed time-delta helper |
+| `src/BNO085Multi.h` | modified | include the helper |
+| `examples/01_SingleSensor/01_SingleSensor.ino` | modified | signed `dt`, negative marker, documented semantics/limits |
+| `test/native/test_main.cpp` | modified | 5 new cases, 16 new checks |
+| `output.md` | modified | this Pass 5 record |
+
+Executed evidence: host suite **44 cases / 201 checks / 0 failures / PASS (exit 0)**;
+ESP32-S3 compile **exit 0**, **324 262 B flash (24%)**, **23 880 B static RAM (7%)**.
+Pass 5B/5C/5D are investigations only; no implementation was added for them. No commit,
+stage, push, amend or history change was performed.

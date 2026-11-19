@@ -15,6 +15,18 @@
 //
 // This sketch is the Phase 1 acceptance sketch. It has been compiled but not
 // run against hardware in this repository.
+//
+// Timestamp diagnostic (`dt=` on each RV line):
+//   dt = tHost - tMeas, printed as a signed value. It is the interval between
+//   the hub's estimated measurement instant and the moment the host first
+//   observed the interrupt. It is therefore a coarse transport/scheduling
+//   figure, not a sensor latency: it includes the hub delay-field
+//   compensation, and tHost is captured by the polling loop (there is no ISR
+//   in Phase 1), so it can lag the physical INT edge by up to one loop period.
+//   A negative value means tMeas is later than tHost. That is not a huge
+//   latency; it indicates clock-reference skew or an unaligned 0xFB base.
+//   The value is valid across one 32-bit micros() rollover while the two
+//   readings are less than 2^31 us (~35.8 min) apart.
 
 #include <BNO085Multi.h>
 
@@ -161,13 +173,15 @@ void loop() {
   bno085::Quaternion q;
   if (imu.latest(q)) {
     ++reportCount;
-    Serial.printf("RV #%lu seq=%u acc=%-10s q=%.5f %.5f %.5f %.5f tMeas=%lu dt=%lu\n",
+    const int32_t dtUs = bno085::timeDeltaUs(q.tHostUs, q.tMeasUs);
+    Serial.printf("RV #%lu seq=%u acc=%-10s q=%.5f %.5f %.5f %.5f tMeas=%lu dt=%ldus%s\n",
                   static_cast<unsigned long>(reportCount),
                   static_cast<unsigned>(q.seq), bno085::accuracyName(q.accuracy),
                   static_cast<double>(q.w), static_cast<double>(q.x),
                   static_cast<double>(q.y), static_cast<double>(q.z),
                   static_cast<unsigned long>(q.tMeasUs),
-                  static_cast<unsigned long>(q.tHostUs - q.tMeasUs));
+                  static_cast<long>(dtUs),
+                  (dtUs < 0) ? " (tMeas ahead of tHost)" : "");
   }
 
   handleSerial();

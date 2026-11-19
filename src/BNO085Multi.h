@@ -11,6 +11,7 @@
 #include "BNO085Sensor.h"
 #include "diag/Logger.h"
 #include "output/IOutputSink.h"
+#include "util/TimeDelta.h"
 
 #if defined(ARDUINO)
 #include "hal/Esp32SpiHal.h"
