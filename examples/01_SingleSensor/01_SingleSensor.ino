@@ -99,6 +99,21 @@ void printDiagnostics() {
                 static_cast<unsigned long>(d.reportsDecoded),
                 static_cast<unsigned long>(d.lastReportUs),
                 static_cast<unsigned long>(d.maxServiceUs));
+  Serial.printf("recovery attempts=%u successes=%u failures=%u terminal=%u reason=%s\n",
+                static_cast<unsigned>(d.recoveryAttempts),
+                static_cast<unsigned>(d.recoverySuccesses),
+                static_cast<unsigned>(d.recoveryFailures),
+                d.recoveryTerminal ? 1u : 0u,
+                bno085::errorName(d.lastRecoveryReason));
+  Serial.printf("output enabled=%u written=%lu suppressed=%lu noCap=%lu partial=%lu failed=%lu dropped=%lu lastError=%s\n",
+                d.outputEnabled ? 1u : 0u,
+                static_cast<unsigned long>(d.framesWritten),
+                static_cast<unsigned long>(d.framesSuppressed),
+                static_cast<unsigned long>(d.framesNoCapacity),
+                static_cast<unsigned long>(d.framesPartial),
+                static_cast<unsigned long>(d.framesFailed),
+                static_cast<unsigned long>(d.framesDropped),
+                bno085::errorName(d.lastOutputError));
 }
 
 void handleSerial() {
@@ -139,11 +154,19 @@ void setup() {
   managerConfig.misoPin = BNO085_MISO_PIN;
   managerConfig.mosiPin = BNO085_MOSI_PIN;
   managerConfig.spiHz = BNO085_SPI_HZ;
+#if BNO085_BINARY_OUTPUT
+  // Log text and binary frames would share Serial and corrupt each other, so
+  // logging stays off on this port. Use diagnostics over the binary protocol
+  // (SensorStatus) or a second UART for logs.
+  managerConfig.log = nullptr;
+  managerConfig.logLevel = bno085::LogLevel::Off;
+#else
   managerConfig.log = &logSink;
   managerConfig.logLevel = BNO085_LOG_LEVEL;
   managerConfig.logCategories = static_cast<uint16_t>(
       bno085::LogReset | bno085::LogInit | bno085::LogInt | bno085::LogSh2 |
       bno085::LogData | bno085::LogShtp | bno085::LogSpi);
+#endif
   managerConfig.statusIntervalMs = 0;  // diagnostics printed on demand
 
 #if BNO085_BINARY_OUTPUT

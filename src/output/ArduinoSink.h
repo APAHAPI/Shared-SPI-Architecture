@@ -15,7 +15,18 @@ namespace bno085 {
 class StreamSink : public IOutputSink {
  public:
   explicit StreamSink(Stream& stream) : stream_(stream) {}
+
+  // HardwareSerial reports free TX-ring space; USB CDC reports free FIFO
+  // space and zero while the host is not connected. A Stream that does not
+  // implement availableForWrite() returns 0, which makes the encoder drop
+  // frames instead of risking a blocking write.
+  size_t availableForWrite() const override {
+    const int free = stream_.availableForWrite();
+    return (free > 0) ? static_cast<size_t>(free) : 0;
+  }
+
   size_t write(const uint8_t* data, size_t len) override {
+    if (len == 0) return 0;
     return stream_.write(data, len);
   }
 

@@ -17,9 +17,9 @@ Kept deliberately granular. "Compiles" is not "works", and simulated is not phys
 
 | Category | State |
 | --- | --- |
-| Implemented | HAL, shared SPI bus manager, per-instance SHTP transport, minimal SH-2 (product ID, reset, set/get feature, Rotation Vector), `Sensor` state machine, CRC-framed binary output, single-sensor example, host test suite |
-| Compiled | `esp32:esp32:esp32s3`, ESP32 Arduino core 3.3.12 — 324 174 B flash (24 %), 23 880 B static RAM (7 %) for the example |
-| Host-unit-tested | 39 cases / 185 checks, 0 failures (MSVC 2022, `test/native`) |
+| Implemented | HAL, shared SPI bus manager, per-instance SHTP transport, minimal SH-2 (product ID, reset, set/get feature, Rotation Vector), `Sensor` state machine with bounded automatic recovery, CRC-framed binary output with loss accounting, single-sensor example, host test suite |
+| Compiled | `esp32:esp32:esp32s3`, ESP32 Arduino core 3.3.12 — 326 142 B flash (24 %), 23 968 B static RAM (7 %) for the example (`--warnings all`, no diagnostics) |
+| Host-unit-tested | 54 cases / 348 checks, 0 failures (MSVC 2022, `test/native`) |
 | Simulated | Mock-HAL, single device. No 20-instance simulation yet |
 | Physically tested | Stages 1–2 plus the oversized-transfer drain: ESP32-S3 + Adafruit BNO085 on COM11 (CH343 UART bridge), SPI mode 3 @ 1 MHz. Boot after reset **93.7 ms**; the **552 B channel-0 advertisement** is drained in 4 bus transactions and the stream returns to idle; 0 bad fragments, 0 bus errors, 0 lock timeouts |
 
@@ -91,10 +91,13 @@ test\native\build_msvc.bat      # Windows / MSVC
 sh test/native/build_gcc.sh     # any host with g++
 ```
 
-They cover CRC vectors, frame encoding, SHTP header parsing, invalid length/channel,
+They cover CRC vectors, frame encoding, output loss accounting (full sink, zero-byte,
+partial and suppressed writes), SHTP header parsing, invalid length/channel,
 oversized-transfer drain (including the regression that the whole transfer must be
 consumed), fragmentation, sequence handling, Rotation Vector decode, Q14 conversion,
-timestamp reconstruction, timeouts and the init state machine. See
+timestamp reconstruction and observation-time semantics, timeouts, the init state
+machine, bounded automatic recovery (backoff, exhaustion, manual recovery, transport
+fault and report silence) and observable output drops. See
 [test/native/README.md](test/native/README.md) for what is simulated and what is not.
 
 ## Documents
@@ -118,8 +121,10 @@ configuration, report decode, hub timestamping). Each `Sensor` owns its SHTP and
 context, so nothing about a device lives in file-scope state. Changing the sensor count
 is a runtime parameter, never a source edit.
 
-Timestamps: `tHostUs` is ESP32 `micros()` at INT observation; `tMeasUs` is the device's own
-measurement time, `tMeas = tEdge + (referenceDelta + delayTicks) × 100 µs`, where
+Timestamps: `tHostUs` is ESP32 `micros()` when the polling loop first observes H_INTN
+asserted; it is not the physical edge time (Phase 1 uses polling, not an ISR). `tMeasUs`
+is the device's own measurement time, `tMeas = tObservation + (referenceDelta +
+delayTicks) × 100 µs`, where
 `referenceDelta` starts at 0 for each input payload, is replaced by `−timebase` when a `0xFB`
 base reference arrives and accumulates a signed `0xFA` rebase (the SH-2 `sh2.c` convention). The
 value is kept modulo 2³² and never merged into the `tHostUs` clock domain. Quaternion components
@@ -136,6 +141,12 @@ preserved alongside.
 - `Sensor::get()` returns `false`; optional reports are not decoded yet.
 - Fragmented payloads are drained and counted, not reassembled — the advertisement on
   this part is 552 B, larger than the transfer buffer.
+- Binary output is synchronously offered to the sink during service. A sink that cannot
+  accept a whole frame causes that frame to be dropped and counted; there is no output
+  queue and no retry. A partial frame can only result from a sink that misreports
+  capacity or returns a short count.
+- Automatic recovery is bounded per sensor (default 5 attempts with 250–4000 ms
+  backoff). Exhaustion enters terminal `Failed`; only `recover()` restarts it.
 - No ESP32-side orientation maths of any kind.
 
 Full detail, including why each deviation was taken, is in

@@ -81,9 +81,13 @@ class Sensor {
   void checkSilence(uint32_t nowUs);
   void emitStatusIfDue(uint32_t nowUs);
   void mirrorStats();
+  void mirrorOutputStats();
+  void observeOutput(bool ok, const char* where);
   void setState(State state);
   void setError(ErrorCode code, const char* where);
-  void enterFailed(ErrorCode code);
+  void scheduleRecovery(ErrorCode reason, bool manual);
+  void failRecoverable(ErrorCode code);
+  void enterTerminalFailed(ErrorCode code);
   void enterStreaming();
 
   static bool reached(uint32_t nowUs, uint32_t deadlineUs) {
@@ -122,7 +126,16 @@ class Sensor {
   uint32_t lastReportUs_;
   uint32_t retryAtUs_;
   bool recovering_;
-  uint8_t recoveryAttempts_;
+  uint16_t recoveryAttempts_;
+  uint32_t lastManualRecoverUs_;
+  bool manualRecoverUsed_;
+
+  uint8_t consecutiveBusErrors_;
+  uint8_t consecutiveProtocolErrors_;
+  uint32_t silenceSinceUs_;
+
+  bool outputEnabled_;
+  uint32_t lastOutputLogUs_;
 };
 
 } // namespace bno085

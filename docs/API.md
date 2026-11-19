@@ -3,6 +3,10 @@
 Phase 0 deliverable — interface design for review. These signatures are the contract
 the implementation is written against. The Phase 1 subset is implemented; see
 `PHASE1-NOTES.md` for exactly which parts, and §4.1 for the 16-bit frame sequence.
+The implemented `Sensor` API is the single-sensor form shown in §3; the `Manager`
+sketches below are Phase 2, except where marked implemented.
+
+Phase 1 recovery and output-loss semantics are specified in §2.4, §2.6 and §4.11.
 
 Namespace: `bno085`. Umbrella header: `<BNO085Multi.h>`.
 
@@ -62,7 +66,8 @@ enum class State : uint8_t {
 struct Status {                    // return type of begin()/recover()
   enum Code : uint8_t {
     Ok = 0, InvalidConfig, DuplicatePin, NoSensors, NoMemory,
-    BusUnavailable, OutputUnavailable, AlreadyStarted, SensorFailed
+    BusUnavailable, OutputUnavailable, AlreadyStarted, SensorFailed,
+    RecoveryRateLimited           // recover() called again too soon
   };
   Code    code = Ok;
   uint8_t sensorId = 0xFF;         // first offending sensor, when applicable
@@ -139,11 +144,16 @@ record carries flag bit 0 (source = GRV) and an `ERROR` frame is emitted once.
 enum class OutputMode : uint8_t { Binary, JsonDebug, None };
 
 struct RecoveryPolicy {
-  uint8_t  maxAttempts      = 5;
+  uint8_t  maxAttempts      = 5;     // consecutive automatic attempts
   uint16_t backoffMs[5]     = {250, 500, 1000, 2000, 4000};
   uint16_t bootTimeoutMs    = 300;   // datasheet: 94 ms typical
   uint16_t commandTimeoutMs = 100;   // per SH-2 request
   bool     resetOnBootTimeout = true;
+
+  bool     autoRecover             = true;  // false = manual recover() only
+  uint8_t  transientErrorThreshold = 3;     // consecutive SPI/protocol faults
+  uint16_t silenceRecoveryMs       = 2000;  // Degraded dwell before recovery; 0 off
+  uint16_t manualRecoverIntervalMs = 1000;  // rate limit for recover()
 };
 
 struct ManagerConfig {
@@ -176,7 +186,8 @@ struct Quaternion {
 
   Accuracy accuracy = Accuracy::Unreliable;          // status bits 1:0
   uint32_t tMeasUs  = 0;    // device measurement time (hub domain)
-  uint32_t tHostUs  = 0;    // ESP32 micros() at INT assertion
+  uint32_t tHostUs  = 0;    // micros() when INT was first observed (polled,
+                            // not the physical edge; see ARCHITECTURE §6.4)
   uint8_t  seq      = 0;    // per report ID
   uint8_t  epoch    = 0;    // increments on hub reset / timestamp rebase
   Report   source   = Report::RotationVector;
@@ -188,10 +199,10 @@ Mapping from the SH-2 report (`i, j, k, real`): `x = i / 16384`, `y = j / 16384`
 `z = k / 16384`, `w = real / 16384`. This mapping is fixed and documented because
 quaternion component-order mistakes are silent.
 
-`tMeasUs` is reconstructed exactly as the datasheet specifies: host interrupt
-timestamp, minus the timebase reference, plus the report's delay field. `tHostUs` is
-the ESP32 clock. They are different clock domains and both are exported; see
-`docs/ARCHITECTURE.md` §9.5.
+`tMeasUs` is reconstructed exactly as the datasheet specifies: host observation
+timestamp, minus the timebase reference, plus the report's delay field. `tHostUs` is that
+same observation time in the ESP32 clock domain. They are different clock domains and
+both are exported; see `docs/ARCHITECTURE.md` §9.5.
 
 ### 2.6 Records and diagnostics
 
@@ -211,26 +222,52 @@ struct Record {
 
 struct Diagnostics {
   State     state;
-  uint16_t  lastError;          // ErrorCode
-  uint32_t  productId;          // swPartNumber from the device
-  uint8_t   fwMajor, fwMinor;
-  uint16_t  fwPatch;
+  ErrorCode lastError;
+  Accuracy  lastAccuracy;
+  uint8_t   initStage;
+
+  ProductInfo product;
   uint32_t  grantedIntervalUs;  // what the device actually accepted
 
-  uint32_t  rxPackets, txPackets, rxBytes;
-  uint16_t  spiErrors, busBusy;
-  uint16_t  shortPackets, badChannels, badFragments, oversizePayloads;
-  uint16_t  sequenceGaps, duplicates;
-  uint32_t  missedReports;
-  uint16_t  resets, recoveryAttempts;
-  uint32_t  lastReportUs, lastErrorUs;
-  uint32_t  maxServiceUs;       // worst observed service time
+  // Reset / interrupt / bus
+  uint32_t resets, resetPulses, intAssertions, intSpurious;
+  uint32_t csTransactions, spiTransfers, spiErrors, busTimeouts, transferBytes;
+
+  // SHTP
+  uint32_t shtpPackets, shtpBytes, shtpTxPackets, shtpErrors;
+  uint16_t shortFragments, badChannels, badFragments, oversizePayloads;
+  uint16_t sequenceGaps, spuriousInterrupts;
+
+  // SH-2
+  uint16_t sh2Timeouts, sh2BadResponses, unknownReports, duplicateReports;
+  uint32_t reportsDecoded, missedReports;
+
+  // Recovery (bounded automatic attempts)
+  uint16_t  recoveryAttempts;    // current consecutive streak (0 when healthy)
+  uint16_t  recoverySuccesses;   // recoveries that reached Streaming
+  uint16_t  recoveryFailures;    // boot/config attempts that failed
+  bool      recoveryTerminal;    // budget exhausted; only recover() restarts
+  ErrorCode lastRecoveryReason;
+  uint32_t  lastRecoveryUs;
+
+  // Output loss accounting (see §4.11)
+  bool      outputEnabled;
+  uint32_t  framesWritten, framesSuppressed, framesTooLarge;
+  uint32_t  framesNoCapacity, framesPartial, framesFailed, framesDropped;
+  ErrorCode lastOutputError;
+  uint32_t  lastOutputErrorUs;
+
+  // Timing
+  uint32_t lastIntUs, lastReportUs, lastErrorUs;
+  uint32_t maxServiceUs, serviceCalls;
 };
 ```
 
 `missedReports` counts `reportSeq` gaps; `duplicates` counts retransmissions detected
 by an unchanged sequence **and** an unchanged `tMeasUs` (the BNO085 retries when the
-host exceeds its ~10 ms host-response window).
+host exceeds its ~10 ms host-response window). `framesDropped` is the sum of
+`framesTooLarge + framesNoCapacity + framesPartial + framesFailed`; suppressed frames
+are not loss because no sink was attached.
 
 ---
 
@@ -252,7 +289,8 @@ class Sensor {
 
   const Diagnostics& diagnostics() const;
 
-  bool recover();                            // reset + re-init this sensor only
+  Status recover();                           // reset + re-init this sensor only;
+                                              // Ok / RecoveryRateLimited / InvalidConfig
   bool configure(Report r, uint32_t intervalUs);  // runtime change, bounded
   void disable();
 };
@@ -344,6 +382,9 @@ Little-endian, packed, no padding.
   `0x1021`, no reflection, xor-out `0`. Check value for `"123456789"` is `0x29B1`.
 - **Maximum frame:** 8 + 64 + 2 = 74 bytes. A receiver that sees `N > 64` must discard
   to the next `A5 5A`.
+- **Sequence gaps are loss:** a real write attempt consumes one frame sequence number
+  even when the sink rejects the frame, so a receiver sees a gap rather than silently
+  contiguous data. Suppressed frames (no sink attached) do not consume a sequence.
 - **Resynchronisation:** scan for `A5 5A`, then require a valid version, a legal type,
   `N <= 64`, and a matching CRC before accepting a frame.
 
@@ -486,9 +527,35 @@ self-describing instead of relying on a fixed table per type.
 15 OutputOverflow
 16 GrvFallbackUsed
 17 UnsupportedReport
+18 OutputUnavailable
 ```
 
 Values are stable; new codes append, never renumber.
+
+### 4.11 Output sink contract and loss semantics
+
+The encoder asks the sink for free space **before** writing. The frame is offered
+atomically: either the whole frame is accepted, or nothing is written and the frame is
+counted as dropped. There is no output queue, no retry and no partial-frame
+reconstruction. This keeps a slow serial link from delaying sensor servicing
+indefinitely; capacity checks and the sink's write must be non-blocking.
+
+| Outcome | Meaning | Counter | Sequence consumed |
+| --- | --- | --- | --- |
+| `Ok` | whole frame accepted | `framesWritten` | yes |
+| `Suppressed` | no sink attached; nothing expected | `framesSuppressed` | no |
+| `TooLarge` | payload > 64 B (programming error) | `framesTooLarge` | no |
+| `NoCapacity` | sink reported less free space than the frame | `framesNoCapacity` | yes |
+| `PartialWrite` | sink accepted a prefix (misreported capacity) | `framesPartial` | yes |
+| `FailedWrite` | sink accepted zero bytes | `framesFailed` | yes |
+
+A sink may report `npos` from `availableForWrite()` to mean "unknown; attempt the
+write". `StreamSink` maps `Stream::availableForWrite()` to the same contract; a
+`Stream` that returns 0 (including an unconnected USB CDC or a `Stream` that does not
+implement capacity) therefore drops frames instead of blocking. `lastOutputError`
+becomes `OutputOverflow` on the first drop and `OutputUnavailable` when binary output
+was requested without a sink. The status frame keeps its 24-byte layout, so output
+counters are exposed through `Diagnostics`, not on the wire.
 
 ---
 

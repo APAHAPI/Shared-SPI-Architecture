@@ -8,8 +8,8 @@
 namespace bno085 {
 
 BinaryEncoder::BinaryEncoder()
-    : sink_(nullptr), log_(nullptr), sequence_(0), frames_(0), dropped_(0),
-      frame_() {}
+    : sink_(nullptr), log_(nullptr), sequence_(0), stats_(),
+      lastResult_(EmitResult::Ok), loggedDrop_(false), frame_() {}
 
 void BinaryEncoder::attach(IOutputSink* sink, Logger* log) {
   sink_ = sink;
@@ -18,18 +18,21 @@ void BinaryEncoder::attach(IOutputSink* sink, Logger* log) {
 
 void BinaryEncoder::reset() {
   sequence_ = 0;
-  frames_ = 0;
-  dropped_ = 0;
+  stats_ = OutputStats();
+  lastResult_ = EmitResult::Ok;
+  loggedDrop_ = false;
 }
 
 bool BinaryEncoder::emit(protocol::PacketType type, const uint8_t* payload,
                          uint16_t len) {
   if (sink_ == nullptr) {
-    ++dropped_;
+    ++stats_.suppressed;
+    lastResult_ = EmitResult::Suppressed;
     return false;
   }
   if (len > protocol::kMaxPayloadBytes) {
-    ++dropped_;
+    ++stats_.tooLarge;
+    lastResult_ = EmitResult::TooLarge;
     if (log_) log_->log(LogLevel::Error, LogData, "frame payload %u too large",
                         static_cast<unsigned>(len));
     return false;
@@ -40,6 +43,8 @@ bool BinaryEncoder::emit(protocol::PacketType type, const uint8_t* payload,
   frame_[2] = protocol::kVersion;
   frame_[3] = static_cast<uint8_t>(type);
   protocol::putU16(frame_ + 4, len);
+  // A real attempt consumes a sequence number even when the write then fails,
+  // so the consumer sees a gap instead of silently receiving contiguous data.
   protocol::putU16(frame_ + protocol::kSequenceOffset, sequence_++);
   if (len > 0 && payload != nullptr) {
     std::memcpy(frame_ + protocol::kHeaderBytes, payload, len);
@@ -50,18 +55,51 @@ bool BinaryEncoder::emit(protocol::PacketType type, const uint8_t* payload,
   protocol::putU16(frame_ + protocol::kHeaderBytes + len, crc);
 
   const size_t total = protocol::kHeaderBytes + len + 2u;
-  const size_t written = sink_->write(frame_, total);
-  if (written != total) {
-    ++dropped_;
-    if (log_) {
-      log_->log(LogLevel::Warn, LogData, "short output write %u/%u",
-                static_cast<unsigned>(written), static_cast<unsigned>(total));
+
+  // Capacity is checked before touching the wire. A full sink drops the whole
+  // frame, so a partial frame is only possible from a sink that lies about
+  // capacity or returns a short count from write().
+  const size_t capacity = sink_->availableForWrite();
+  if (capacity < total) {
+    ++stats_.noCapacity;
+    lastResult_ = EmitResult::NoCapacity;
+    if (log_ && !loggedDrop_) {
+      loggedDrop_ = true;
+      log_->log(LogLevel::Warn, LogData,
+                "output full: frame %u B, %u B free (seq %u)",
+                static_cast<unsigned>(total), static_cast<unsigned>(capacity),
+                static_cast<unsigned>(static_cast<uint16_t>(sequence_ - 1u)));
     }
     return false;
   }
 
-  ++frames_;
-  return true;
+  const size_t written = sink_->write(frame_, total);
+  if (written == total) {
+    ++stats_.written;
+    lastResult_ = EmitResult::Ok;
+    loggedDrop_ = false;
+    return true;
+  }
+
+  if (written == 0) {
+    ++stats_.failed;
+    lastResult_ = EmitResult::FailedWrite;
+    if (log_ && !loggedDrop_) {
+      loggedDrop_ = true;
+      log_->log(LogLevel::Warn, LogData, "output write failed: 0/%u B",
+                static_cast<unsigned>(total));
+    }
+    return false;
+  }
+
+  ++stats_.partial;
+  lastResult_ = EmitResult::PartialWrite;
+  if (log_ && !loggedDrop_) {
+    loggedDrop_ = true;
+    log_->log(LogLevel::Warn, LogData, "short output write %u/%u B",
+              static_cast<unsigned>(written), static_cast<unsigned>(total));
+  }
+  return false;
 }
 
 bool BinaryEncoder::writeHello(uint8_t sensorCount, uint16_t libraryVersion,
@@ -149,7 +187,7 @@ bool BinaryEncoder::writeManagerDiagnostics(uint8_t sensorCount,
   p[0] = sensorCount;
   p[1] = streamingCount;
   protocol::putU16(p + 2, busBusy);
-  protocol::putU32(p + 4, frames_);
+  protocol::putU32(p + 4, stats_.written);
   protocol::putU32(p + 8, queueDrops);
   protocol::putU32(p + 12, uptimeMs);
   protocol::putU32(p + 16, maxUpdateUs);

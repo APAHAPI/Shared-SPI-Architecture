@@ -8,9 +8,9 @@ namespace bno085 {
 namespace {
 // Reference sh2.c sensorhubInputHdlr(): referenceDelta starts at 0 for each
 // input payload. A 0xFB base timestamp reference replaces it with -timebase;
-// a 0xFA rebase adds a signed delta. The host timestamps at H_INTN assertion
-// and each report adds its own delay in 100 us units (datasheet 1000-3927
-// section 1.3.5).
+// a 0xFA rebase adds a signed delta. The host timestamp is the polled
+// observation time of H_INTN (not the physical edge); each report adds its own
+// delay in 100 us units (datasheet 1000-3927 section 1.3.5).
 constexpr int64_t kDefaultReferenceDeltaTicks = 0;
 constexpr int32_t kTimestampTickUs = 100;
 constexpr float kQ14Scale = 1.0f / 16384.0f;

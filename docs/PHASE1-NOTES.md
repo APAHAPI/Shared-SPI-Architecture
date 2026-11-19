@@ -24,17 +24,18 @@ GRV configuration is rejected with `UnsupportedReport`).
 | 1 | `Sensor` constructs its own HAL | `Sensor(IHal&)` takes the HAL by reference | Keeps the core free of Arduino headers and host-testable; Phase 2 `Manager` will own the bus and the HALs and hand each sensor a reference |
 | 2 | Use the CEVA SH-2 library where possible | Own minimal SHTP + SH-2 for product id, reset, set/get feature and Rotation Vector | The upstream library is a process-wide singleton with unbounded wait loops; both are disqualifying for a shared-bus design. See `UPSTREAM-AUDIT.md` |
 | 3 | Frame sequence is a 32-bit field at offset 6 | 16-bit sequence at offset 6 | The table entry (offset 6, 4 bytes) overlaps the payload at offset 8 and makes the frame 36 B, which contradicts the same document's 34 B quaternion frame, 74 B maximum frame, and CRC range `[2, 8+N)`. The 8-byte header is what the bandwidth analysis in `RESOURCE-ANALYSIS.md` assumes, so the header was kept and the field narrowed. `API.md` §4.1 now states the 16-bit rule. Hosts must compute loss modulo 65536 |
-| 4 | `tMeas` reconstructed from the datasheet | `tMeas = tEdge - 12000 us + delayTicks * 100` plus a rebase offset | The 0xFA base-timestamp-reference report is recorded but not applied; applying it needs measured hardware behaviour, so it is deferred rather than guessed |
+| 4 | `tMeas` reconstructed from the datasheet | `tMeas = tObservation + (referenceDelta + delayTicks) × 100 µs`; `referenceDelta` starts at 0 per payload, `0xFB` sets `−timebase`, `0xFA` adds a signed rebase | Pass 3 corrected the report IDs/channel and pass 4 made the per-payload fallback reference-exact. `tObservation` is the polled host time, not the physical INT edge (see §6.4 in `ARCHITECTURE.md`) |
 | 5 | Handle fragmented or continued SHTP transfers | Oversize transfers are drained in bounded chunks following continuation headers; the payload is not assembled | The real advertisement is 552 B (measured), larger than the 256 B transfer buffer and the 192 B payload buffer. Assembling everything would cost ~1.1 KB more per sensor for a payload nothing consumes. The drain is bounded to 8 fragments |
 | 6 | Full wake/reset sequencing | Reset pulse implemented; optional `wakePin` supported but defaults to `-1` | Whether a given board wires PS0/WAKE is a board decision; the HAL supports it and the default assumes the part is awake |
 | 7 | `Sensor::get()` delivers records | Returns `false` in Phase 1 | Records are delivered through the callback and the output sink; the manager queue that backs `get()` is Phase 2 |
 | 8 | Advertisement is ~276 B (implied by the channel math) | 552 B on the tested part | Measured on hardware. `MAX_PAYLOAD_IN`-style assumptions in the upstream docs are 4 × 68 B entries; this firmware sends twice that. Any buffer sizing based on 276 B would fail at the first packet of every cold boot |
 
-> **Superseded (2026-11-18).** Deviation 4 and the host-test count below describe the
+> **Superseded (2026-11-19).** Deviation 4 and the host-test count below described the
 > Phase 1 delivery. Pass 3 corrected the timestamp IDs/channel handling; pass 4 made
-> the per-payload fallback reference-exact (0 ticks, no negative clamp). Current
-> behaviour is in `output.md` §14 and `README.md`. The suite is now 39 cases /
-> 185 checks.
+> the per-payload fallback reference-exact (0 ticks, no negative clamp); pass 6 added
+> bounded automatic recovery, output loss accounting and the formal polling/observation
+> timestamp contract. Current behaviour is in `output.md` and `README.md`. The suite is
+> now 54 cases / 348 checks.
 
 ## Evidence
 
@@ -54,8 +55,10 @@ SPI mode 3 at 1 MHz, pins 12/11/13/10/9/8):
 
 **Host tests at Phase 1 delivery:** 168 checks across 30 cases, 0 failures, via
 `test\native\build_msvc.bat` (MSVC 2022). See `test/native/README.md` for what each
-case covers and for the simulated-versus-real distinction. (Current count: 39 cases /
-185 checks; see `output.md` §14.)
+case covers and for the simulated-versus-real distinction. **Current suite:** 54 cases /
+348 checks, 0 failures; it now includes bounded recovery, exhaustion/manual recovery,
+transport-fault and silence triggers, output loss accounting, and polling observation
+time.
 
 ## Transport fix: oversized transfer drain (validated on hardware)
 
@@ -82,7 +85,8 @@ result codes, timeouts and the bounded 8-fragment guard are untouched.
 
 **Procedure.**
 
-1. `test\native\build_msvc.bat` — 30 cases / 168 checks.
+1. `test\native\build_msvc.bat` — 54 cases / 348 checks (30 cases / 168 checks at the
+   time of this fix).
 2. Re-introduce `length - 4` temporarily: 6 checks fail in the two regression cases,
    confirming the tests detect the defect rather than merely coexisting with it.
 3. Compile `test/hardware/02_TransportDrain` for `esp32:esp32:esp32s3`.
@@ -118,7 +122,8 @@ advertisement; nothing here exercises SH-2, report configuration, timestamps or
 soak behaviour, which remain stages 3–8.
 
 **Compilation:** `examples/01_SingleSensor` compiles for `esp32:esp32:esp32s3`
-(ESP32 core 3.3.12), 324 262 B flash (24 %), 23 880 B static RAM (7 %).
+(ESP32 core 3.3.12), 326 142 B flash (24 %), 23 968 B static RAM (7 %), no warnings with
+`--warnings all`.
 
 ## Still to verify on hardware
 
@@ -130,12 +135,17 @@ Stages 1–2 above are done. The rest of the Phase 1 exit criteria are open:
 3. **Continuous quaternion output** and decode correctness. Includes confirming the
    report layout, the accuracy bits, and that `rawW..rawZ` match the wire values.
 4. **10-minute soak** at 100 Hz: zero frame errors, zero sequence gaps.
-5. **Disconnected INT line**: the sensor must fail with a diagnostic inside its
-   bounded timeout and never hang the sketch.
+5. **Disconnected INT line**: the sensor must reach `Degraded`, then start bounded
+   recovery after `silenceRecoveryMs`, and never hang the sketch.
 6. **30 consecutive cold boots.**
 7. **Adafruit comparison** on identical wiring.
-8. **Timestamp reconstruction**: confirm the 12 000 µs edge-to-reception offset and the
-   100 µs delay-tick scale against a known motion, then decide whether the 0xFA rebase
-   is needed.
+8. **Timestamp reconstruction**: confirm the 100 µs delay-tick scale and the signed
+   `0xFB`/`0xFA` reference arithmetic against a known motion; measure the polled
+   observation lag to decide whether Phase 2 needs an ISR edge capture.
+9. **Recovery timing**: measure the real boot/backoff durations, confirm attempts stop
+   after `maxAttempts`, and that a manual `recover()` after terminal failure works.
+10. **Output backpressure**: fill the UART/USB ring and confirm frames are dropped with
+    `framesNoCapacity`/`framesDropped` increasing, no stall in `service`, and a
+    sequence gap visible to the PC parser.
 9. **Sleep/wake**: whether writes to a sleeping part fail, and whether PS0/WAKE must be
    wired.

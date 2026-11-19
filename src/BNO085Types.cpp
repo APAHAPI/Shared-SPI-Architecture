@@ -72,6 +72,7 @@ const char* errorName(ErrorCode code) {
     case ErrorCode::OutputOverflow:    return "output-overflow";
     case ErrorCode::GrvFallbackUsed:   return "grv-fallback-used";
     case ErrorCode::UnsupportedReport: return "unsupported-report";
+    case ErrorCode::OutputUnavailable: return "output-unavailable";
   }
   return "unknown";
 }
@@ -87,6 +88,7 @@ const char* Status::str() const {
     case OutputUnavailable:  return "output-unavailable";
     case AlreadyStarted:     return "already-started";
     case SensorFailed:       return "sensor-failed";
+    case RecoveryRateLimited: return "recovery-rate-limited";
   }
   return "unknown";
 }

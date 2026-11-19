@@ -17,7 +17,11 @@ Sensor::Sensor(IHal& hal)
       stageDeadlineUs_(0), nextAttemptUs_(0), bootPacketBaseline_(0),
       setFeatureSent_(false), getFeatureSent_(false), intPending_(false),
       intEdgeUs_(0), lastStatusUs_(0), lastReportUs_(0), retryAtUs_(0),
-      recovering_(false), recoveryAttempts_(0) {}
+      recovering_(false), recoveryAttempts_(0),
+      lastManualRecoverUs_(0), manualRecoverUsed_(false),
+      consecutiveBusErrors_(0),
+      consecutiveProtocolErrors_(0), silenceSinceUs_(0), outputEnabled_(false),
+      lastOutputLogUs_(0) {}
 
 Status Sensor::begin(const ManagerConfig& managerConfig,
                      const SensorConfig& sensorConfig, uint8_t index) {
@@ -53,7 +57,18 @@ Status Sensor::begin(const ManagerConfig& managerConfig,
   log_.setCategories(manager_.logCategories);
 
   output_ = manager_.output;
-  encoder_.attach(manager_.emitBinaryFrames ? output_ : nullptr, &log_);
+  outputEnabled_ = manager_.emitBinaryFrames && output_ != nullptr;
+  if (manager_.emitBinaryFrames && output_ == nullptr) {
+    // Keep the historical default (binary output on) from silently doing
+    // nothing when no sink was supplied. The sensor still runs; the reason is
+    // visible in diagnostics and the log.
+    diag_.lastOutputError = ErrorCode::OutputUnavailable;
+    if (log_.enabled(LogLevel::Warn, LogData)) {
+      log_.log(LogLevel::Warn, LogData,
+               "s%u binary output requested but no sink; disabled", index_);
+    }
+  }
+  encoder_.attach(outputEnabled_ ? output_ : nullptr, &log_);
 
   shtp_.attach(&hal_, &log_, index_);
   shtp_.setHandler(&Sensor::channelThunk, this);
@@ -81,8 +96,22 @@ Status Sensor::begin(const ManagerConfig& managerConfig,
   started_ = true;
   recoveryAttempts_ = 0;
   recovering_ = false;
+  lastManualRecoverUs_ = 0;
+  manualRecoverUsed_ = false;
+  consecutiveBusErrors_ = 0;
+  consecutiveProtocolErrors_ = 0;
+  silenceSinceUs_ = 0;
+  diag_.outputEnabled = outputEnabled_;
+  diag_.recoveryAttempts = 0;
+  diag_.recoverySuccesses = 0;
+  diag_.recoveryFailures = 0;
+  diag_.recoveryTerminal = false;
+  diag_.lastRecoveryReason = ErrorCode::None;
+  diag_.lastRecoveryUs = 0;
   encoder_.reset();
-  encoder_.writeHello(1, 0x0001, hal_.timeUs());
+  if (outputEnabled_) {
+    observeOutput(encoder_.writeHello(1, 0x0001, hal_.timeUs()), "hello");
+  }
   if (log_.enabled(LogLevel::Info, LogInit)) {
     log_.log(LogLevel::Info, LogInit,
              "s%u begin cs=%d int=%d rst=%d wake=%d rate=%luus", index_,
@@ -98,6 +127,9 @@ Status Sensor::begin(const ManagerConfig& managerConfig,
 void Sensor::end() {
   hal_.end();
   started_ = false;
+  recovering_ = false;
+  outputEnabled_ = false;
+  diag_.outputEnabled = false;
   setState(State::Unconfigured);
 }
 
@@ -112,6 +144,9 @@ void Sensor::startBoot() {
   setFeatureSent_ = false;
   getFeatureSent_ = false;
   intPending_ = false;
+  consecutiveBusErrors_ = 0;
+  consecutiveProtocolErrors_ = 0;
+  silenceSinceUs_ = 0;
 
   const uint32_t now = hal_.timeUs();
   stageDeadlineUs_ = now + static_cast<uint32_t>(manager_.recovery.bootTimeoutMs) * 1000u;
@@ -151,10 +186,15 @@ void Sensor::update() {
     }
   } else {
     serviceBus(startUs);
-    sh2_.pollTimeouts(hal_.timeUs());
-    advanceInit(hal_.timeUs());
-    checkSilence(hal_.timeUs());
-    emitStatusIfDue(hal_.timeUs());
+    // A transport fault handled inside the drain can start recovery (or hit
+    // the terminal state) on this same pass. Do not let the remaining init
+    // stages run against the stage that recovery just rewound.
+    if (state_ != State::Recovering && state_ != State::Failed) {
+      sh2_.pollTimeouts(hal_.timeUs());
+      advanceInit(hal_.timeUs());
+      checkSilence(hal_.timeUs());
+      emitStatusIfDue(hal_.timeUs());
+    }
   }
 
   const uint32_t elapsed = hal_.timeUs() - startUs;
@@ -189,27 +229,59 @@ void Sensor::serviceBus(uint32_t nowUs) {
     const ShtpResult result = shtp_.service(intEdgeUs_);
     ++visits;
 
+    ErrorCode recoveryReason = ErrorCode::None;
     switch (result) {
       case ShtpResult::NoData:
         intPending_ = false;
         break;
       case ShtpResult::Spurious:
         ++diag_.intSpurious;
+        consecutiveBusErrors_ = 0;
+        consecutiveProtocolErrors_ = 0;
         intPending_ = false;
         break;
       case ShtpResult::Ok:
+        consecutiveBusErrors_ = 0;
+        consecutiveProtocolErrors_ = 0;
+        break;
       case ShtpResult::Fragment:
+        consecutiveBusErrors_ = 0;
         break;
       case ShtpResult::BusError:
         setError(ErrorCode::SpiRead, "shtp-read");
         intPending_ = false;
+        if (++consecutiveBusErrors_ >=
+                manager_.recovery.transientErrorThreshold &&
+            stage_ == StageStream) {
+          recoveryReason = ErrorCode::SpiRead;
+        }
         break;
       case ShtpResult::Malformed:
         setError(ErrorCode::ShtpBadFrame, "shtp-frame");
+        if (++consecutiveProtocolErrors_ >=
+                manager_.recovery.transientErrorThreshold &&
+            stage_ == StageStream) {
+          recoveryReason = ErrorCode::ShtpBadFrame;
+        }
         break;
       case ShtpResult::Oversize:
+        // A legal but unbufferable transfer (the boot advertisement) is
+        // drained by the transport. Only repeated oversize while streaming
+        // suggests a desynchronised link.
         setError(ErrorCode::ShtpBadFrame, "shtp-oversize");
+        if (++consecutiveProtocolErrors_ >=
+                manager_.recovery.transientErrorThreshold &&
+            stage_ == StageStream) {
+          recoveryReason = ErrorCode::ShtpBadFrame;
+        }
         break;
+    }
+
+    if (recoveryReason != ErrorCode::None) {
+      consecutiveBusErrors_ = 0;
+      consecutiveProtocolErrors_ = 0;
+      failRecoverable(recoveryReason);
+      break;
     }
 
     if (!hal_.intAsserted()) intPending_ = false;
@@ -233,7 +305,7 @@ void Sensor::advanceInit(uint32_t nowUs) {
                    index_);
         }
       } else if (reached(nowUs, stageDeadlineUs_)) {
-        enterFailed(ErrorCode::BootTimeout);
+        failRecoverable(ErrorCode::BootTimeout);
       }
       break;
 
@@ -248,7 +320,7 @@ void Sensor::advanceInit(uint32_t nowUs) {
                    index_);
         }
       } else if (reached(nowUs, stageDeadlineUs_)) {
-        enterFailed(ErrorCode::Sh2Timeout);
+        failRecoverable(ErrorCode::Sh2Timeout);
       } else if (!sh2_.busy() && reached(nowUs, nextAttemptUs_)) {
         sh2_.requestProductIds(nowUs);
         nextAttemptUs_ = nowUs + kRetryIntervalUs;
@@ -268,32 +340,41 @@ void Sensor::advanceInit(uint32_t nowUs) {
         stage_ = StageGetFeature;
         diag_.initStage = static_cast<uint8_t>(stage_);
         stageDeadlineUs_ = nowUs + commandTimeoutUs();
+        nextAttemptUs_ = nowUs;
+        getFeatureSent_ = false;
       } else if (sh2_.cmdState() == Sh2Client::CmdState::HubError) {
-        enterFailed(ErrorCode::Sh2BadResponse);
+        failRecoverable(ErrorCode::Sh2BadResponse);
       } else if (sh2_.cmdState() == Sh2Client::CmdState::Timeout) {
-        enterFailed(ErrorCode::Sh2Timeout);
+        failRecoverable(ErrorCode::Sh2Timeout);
       } else if (!sh2_.busy() && reached(nowUs, nextAttemptUs_)) {
         setFeatureSent_ = sh2_.setFeature(
             static_cast<uint8_t>(Report::RotationVector), cfg_.intervalUs, nowUs);
         nextAttemptUs_ = nowUs + kRetryIntervalUs;
       } else if (reached(nowUs, stageDeadlineUs_)) {
-        enterFailed(ErrorCode::Sh2Timeout);
+        failRecoverable(ErrorCode::Sh2Timeout);
       }
       break;
 
     case StageGetFeature:
       if (!getFeatureSent_) {
-        getFeatureSent_ =
-            sh2_.getFeature(static_cast<uint8_t>(Report::RotationVector), nowUs);
+        if (reached(nowUs, nextAttemptUs_)) {
+          getFeatureSent_ = sh2_.getFeature(
+              static_cast<uint8_t>(Report::RotationVector), nowUs);
+          nextAttemptUs_ = nowUs + kRetryIntervalUs;
+        }
+        if (!getFeatureSent_ && reached(nowUs, stageDeadlineUs_)) {
+          failRecoverable(ErrorCode::Sh2Timeout);
+        }
         break;
       }
       if (sh2_.featureState() == Sh2Client::CmdState::Ok) {
         enterStreaming();
-      } else if (sh2_.featureState() == Sh2Client::CmdState::HubError ||
-                 sh2_.featureState() == Sh2Client::CmdState::Timeout) {
-        enterFailed(ErrorCode::Sh2BadResponse);
+      } else if (sh2_.featureState() == Sh2Client::CmdState::HubError) {
+        failRecoverable(ErrorCode::Sh2BadResponse);
+      } else if (sh2_.featureState() == Sh2Client::CmdState::Timeout) {
+        failRecoverable(ErrorCode::Sh2Timeout);
       } else if (reached(nowUs, stageDeadlineUs_)) {
-        enterFailed(ErrorCode::Sh2Timeout);
+        failRecoverable(ErrorCode::Sh2Timeout);
       }
       break;
 
@@ -311,13 +392,26 @@ void Sensor::enterStreaming() {
   setState(State::Streaming);
   diag_.initStage = static_cast<uint8_t>(stage_);
   diag_.grantedIntervalUs = sh2_.grantedIntervalUs();
+  if (diag_.recoveryAttempts > 0) {
+    if (diag_.recoverySuccesses < 0xFFFFu) ++diag_.recoverySuccesses;
+  }
   recoveryAttempts_ = 0;
   recovering_ = false;
+  diag_.recoveryAttempts = 0;
+  diag_.recoveryTerminal = false;
+  consecutiveBusErrors_ = 0;
+  consecutiveProtocolErrors_ = 0;
+  silenceSinceUs_ = 0;
   lastReportUs_ = hal_.timeUs();
   lastStatusUs_ = lastReportUs_;
 
-  encoder_.writeInitResult(index_, 0, static_cast<uint8_t>(StageStream),
-                           sh2_.productInfo(), diag_.grantedIntervalUs);
+  if (outputEnabled_) {
+    observeOutput(encoder_.writeInitResult(index_, 0,
+                                           static_cast<uint8_t>(StageStream),
+                                           sh2_.productInfo(),
+                                           diag_.grantedIntervalUs),
+                  "init-result");
+  }
   if (log_.enabled(LogLevel::Info, LogInit)) {
     log_.log(LogLevel::Info, LogInit,
              "s%u streaming at %luus (requested %luus)", index_,
@@ -331,16 +425,32 @@ void Sensor::checkSilence(uint32_t nowUs) {
 
   const uint32_t limit =
       (cfg_.intervalUs * kSilenceFactor) / 2u + kSilenceGraceUs;
-  if (static_cast<uint32_t>(nowUs - lastReportUs_) <= limit) return;
+  if (static_cast<uint32_t>(nowUs - lastReportUs_) <= limit) {
+    silenceSinceUs_ = 0;
+    return;
+  }
 
   if (state_ == State::Streaming) {
     setState(State::Degraded);
     setError(ErrorCode::NoReports, "silence");
-    encoder_.writeError(index_, ErrorCode::NoReports,
-                        static_cast<uint8_t>(stage_), nowUs);
+    silenceSinceUs_ = nowUs;
+    if (outputEnabled_) {
+      observeOutput(encoder_.writeError(index_, ErrorCode::NoReports,
+                                        static_cast<uint8_t>(stage_), nowUs),
+                    "silence");
+    }
     if (log_.enabled(LogLevel::Warn, LogData)) {
       log_.log(LogLevel::Warn, LogData, "s%u no reports for %luus", index_,
                static_cast<unsigned long>(nowUs - lastReportUs_));
+    }
+    return;
+  }
+
+  if (state_ == State::Degraded && manager_.recovery.silenceRecoveryMs > 0) {
+    const uint32_t recoverAfter =
+        static_cast<uint32_t>(manager_.recovery.silenceRecoveryMs) * 1000u;
+    if (static_cast<uint32_t>(nowUs - silenceSinceUs_) >= recoverAfter) {
+      failRecoverable(ErrorCode::NoReports);
     }
   }
 }
@@ -350,7 +460,9 @@ void Sensor::emitStatusIfDue(uint32_t nowUs) {
   const uint32_t interval = static_cast<uint32_t>(manager_.statusIntervalMs) * 1000u;
   if (static_cast<uint32_t>(nowUs - lastStatusUs_) < interval) return;
   lastStatusUs_ = nowUs;
-  encoder_.writeStatus(index_, diag_);
+  if (outputEnabled_) {
+    observeOutput(encoder_.writeStatus(index_, diag_), "status");
+  }
 }
 
 bool Sensor::latest(Quaternion& out) {
@@ -367,29 +479,30 @@ bool Sensor::get(Report report, ImuSample& out) const {
 }
 
 Status Sensor::recover() {
-  if (!started_) {
+  if (!started_ || state_ == State::Disabled) {
     return Status{Status::InvalidConfig, index_};
   }
-  if (recoveryAttempts_ >= manager_.recovery.maxAttempts) {
-    enterFailed(ErrorCode::BootTimeout);
-    return Status{Status::SensorFailed, index_};
+
+  const uint32_t now = hal_.timeUs();
+  const uint32_t limit =
+      static_cast<uint32_t>(manager_.recovery.manualRecoverIntervalMs) * 1000u;
+  if (manualRecoverUsed_ && limit > 0 &&
+      static_cast<uint32_t>(now - lastManualRecoverUs_) < limit) {
+    if (log_.enabled(LogLevel::Warn, LogReset)) {
+      log_.log(LogLevel::Warn, LogReset,
+               "s%u manual recover ignored (rate limited)", index_);
+    }
+    return Status{Status::RecoveryRateLimited, index_};
   }
+  lastManualRecoverUs_ = now;
+  manualRecoverUsed_ = true;
 
-  ++recoveryAttempts_;
-  recovering_ = true;
-  stage_ = StageBoot;
-  setState(State::Recovering);
-  diag_.initStage = static_cast<uint8_t>(stage_);
-
-  const uint32_t backoffMs = manager_.recovery.backoffForAttempt(recoveryAttempts_);
-  retryAtUs_ = hal_.timeUs() + static_cast<uint32_t>(backoffMs) * 1000u;
-
-  if (log_.enabled(LogLevel::Warn, LogReset)) {
-    log_.log(LogLevel::Warn, LogReset, "s%u recover attempt %u/%u in %ums", index_,
-             static_cast<unsigned>(recoveryAttempts_),
-             static_cast<unsigned>(manager_.recovery.maxAttempts),
-             static_cast<unsigned>(backoffMs));
-  }
+  // A manual request is an operator action: give it a fresh bounded budget and
+  // let it work even when automatic recovery is disabled.
+  recoveryAttempts_ = 0;
+  diag_.recoveryAttempts = 0;
+  diag_.recoveryTerminal = false;
+  scheduleRecovery(ErrorCode::None, true);
   return Status{Status::Ok, index_};
 }
 
@@ -433,13 +546,14 @@ void Sensor::onQuaternion(const Quaternion& q) {
 
   if (state_ == State::Degraded) {
     setState(State::Streaming);
+    silenceSinceUs_ = 0;
     if (log_.enabled(LogLevel::Info, LogData)) {
       log_.log(LogLevel::Info, LogData, "s%u reports resumed", index_);
     }
   }
 
-  if (manager_.emitBinaryFrames) {
-    encoder_.writeQuaternion(index_, q);
+  if (outputEnabled_) {
+    observeOutput(encoder_.writeQuaternion(index_, q), "quaternion");
   }
 }
 
@@ -453,6 +567,10 @@ void Sensor::onResetComplete() {
     log_.log(LogLevel::Warn, LogReset, "s%u unexpected device reset, reconfiguring",
              index_);
   }
+  // The device restarted its SHTP sequence counters. Keeping ours would count
+  // a gap on every packet after the reset even though the link is healthy.
+  shtp_.reset();
+  intPending_ = false;
   stage_ = StageSetFeature;
   setState(State::Configuring);
   diag_.initStage = static_cast<uint8_t>(stage_);
@@ -482,6 +600,42 @@ void Sensor::mirrorStats() {
   diag_.unknownReports = h.unknownReports;
   diag_.duplicateReports = h.duplicates;
   diag_.missedReports = h.reportGaps;
+  mirrorOutputStats();
+}
+
+void Sensor::mirrorOutputStats() {
+  const BinaryEncoder::OutputStats& o = encoder_.outputStats();
+  diag_.framesWritten = o.written;
+  diag_.framesSuppressed = o.suppressed;
+  diag_.framesTooLarge = o.tooLarge;
+  diag_.framesNoCapacity = o.noCapacity;
+  diag_.framesPartial = o.partial;
+  diag_.framesFailed = o.failed;
+  diag_.framesDropped = o.dropped();
+}
+
+void Sensor::observeOutput(bool ok, const char* where) {
+  mirrorOutputStats();
+  if (ok) return;
+
+  diag_.lastOutputError = ErrorCode::OutputOverflow;
+  diag_.lastOutputErrorUs = hal_.timeUs();
+
+  // One log per second: an unavailable sink would otherwise flood the log from
+  // inside the report path and make a slow serial link worse.
+  const uint32_t now = hal_.timeUs();
+  if (lastOutputLogUs_ == 0 ||
+      static_cast<uint32_t>(now - lastOutputLogUs_) >= 1000000u) {
+    lastOutputLogUs_ = now;
+    if (log_.enabled(LogLevel::Warn, LogData)) {
+      log_.log(LogLevel::Warn, LogData,
+               "s%u output drop (%s): total=%lu cap=%lu partial=%lu failed=%lu",
+               index_, where, static_cast<unsigned long>(diag_.framesDropped),
+               static_cast<unsigned long>(diag_.framesNoCapacity),
+               static_cast<unsigned long>(diag_.framesPartial),
+               static_cast<unsigned long>(diag_.framesFailed));
+    }
+  }
 }
 
 void Sensor::setState(State state) {
@@ -502,15 +656,77 @@ void Sensor::setError(ErrorCode code, const char* where) {
   }
 }
 
-void Sensor::enterFailed(ErrorCode code) {
+void Sensor::scheduleRecovery(ErrorCode reason, bool manual) {
+  if (!started_ || state_ == State::Disabled) return;
+  if (!manual && !manager_.recovery.autoRecover) {
+    enterTerminalFailed(reason);
+    return;
+  }
+  if (recoveryAttempts_ >= manager_.recovery.maxAttempts) {
+    enterTerminalFailed(reason);
+    return;
+  }
+
+  ++recoveryAttempts_;
+  diag_.recoveryAttempts = recoveryAttempts_;
+  diag_.lastRecoveryUs = hal_.timeUs();
+  if (reason != ErrorCode::None) {
+    diag_.lastRecoveryReason = reason;
+    setError(reason, manual ? "manual-recover" : "recover");
+  }
+
+  recovering_ = true;
+  diag_.recoveryTerminal = false;
+  stage_ = StageBoot;
+  setState(State::Recovering);
+  diag_.initStage = static_cast<uint8_t>(stage_);
+
+  const uint8_t attemptIndex =
+      (recoveryAttempts_ > 0xFFu) ? 0xFFu
+                                  : static_cast<uint8_t>(recoveryAttempts_);
+  const uint16_t backoffMs =
+      manager_.recovery.backoffForAttempt(attemptIndex);
+  retryAtUs_ = hal_.timeUs() + static_cast<uint32_t>(backoffMs) * 1000u;
+
+  if (log_.enabled(LogLevel::Warn, LogReset)) {
+    log_.log(LogLevel::Warn, LogReset, "s%u recover attempt %u/%u in %ums%s",
+             index_, static_cast<unsigned>(recoveryAttempts_),
+             static_cast<unsigned>(manager_.recovery.maxAttempts),
+             static_cast<unsigned>(backoffMs), manual ? " (manual)" : "");
+  }
+}
+
+void Sensor::failRecoverable(ErrorCode code) {
+  if (diag_.recoveryFailures < 0xFFFFu) ++diag_.recoveryFailures;
+  if (!manager_.recovery.autoRecover) {
+    enterTerminalFailed(code);
+    return;
+  }
+  scheduleRecovery(code, false);
+}
+
+void Sensor::enterTerminalFailed(ErrorCode code) {
+  recovering_ = false;
   setState(State::Failed);
-  setError(code, "init");
-  encoder_.writeInitResult(index_, static_cast<uint8_t>(code),
-                           static_cast<uint8_t>(stage_), sh2_.productInfo(),
-                           diag_.grantedIntervalUs);
-  encoder_.writeError(index_, code, static_cast<uint8_t>(stage_), hal_.timeUs());
+  setError(code, "terminal");
+  diag_.recoveryTerminal = true;
+  diag_.lastRecoveryReason = code;
+  diag_.lastRecoveryUs = hal_.timeUs();
+
+  if (outputEnabled_) {
+    observeOutput(encoder_.writeInitResult(
+                      index_, static_cast<uint8_t>(code),
+                      static_cast<uint8_t>(stage_), sh2_.productInfo(),
+                      diag_.grantedIntervalUs),
+                  "init-result");
+    observeOutput(encoder_.writeError(index_, code,
+                                      static_cast<uint8_t>(stage_),
+                                      hal_.timeUs()),
+                  "error");
+  }
+
   if (log_.enabled(LogLevel::Error, LogInit)) {
-    log_.log(LogLevel::Error, LogInit, "s%u init failed: %s", index_,
+    log_.log(LogLevel::Error, LogInit, "s%u terminal failure: %s", index_,
              errorName(code));
   }
 }

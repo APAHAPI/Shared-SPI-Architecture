@@ -93,6 +93,7 @@ enum class ErrorCode : uint8_t {
   OutputOverflow     = 15,
   GrvFallbackUsed    = 16,
   UnsupportedReport  = 17,
+  OutputUnavailable  = 18,
 };
 
 const char* errorName(ErrorCode code);
@@ -108,6 +109,7 @@ struct Status {
     OutputUnavailable,
     AlreadyStarted,
     SensorFailed,
+    RecoveryRateLimited,
   };
 
   Code code = Ok;
@@ -137,8 +139,9 @@ struct Quaternion {
   int16_t rawAccuracy = 0;   // Q12, radians
 
   Accuracy accuracy = Accuracy::Unreliable;
-  uint32_t tMeasUs = 0;      // device measurement time
-  uint32_t tHostUs = 0;      // host time at INT assertion
+  uint32_t tMeasUs = 0;      // device measurement time (hub domain)
+  uint32_t tHostUs = 0;      // host time when INT was first observed (polled;
+                             // not the physical edge time, see docs/API.md)
   uint8_t seq = 0;
   uint8_t epoch = 0;
   Report source = Report::RotationVector;
@@ -231,6 +234,28 @@ struct Diagnostics {
   uint32_t reportsDecoded = 0;
   uint32_t missedReports = 0;
 
+  // Recovery (per-sensor, bounded attempts)
+  uint16_t recoveryAttempts = 0;    // consecutive attempts since last success
+  uint16_t recoverySuccesses = 0;   // recoveries that reached Streaming
+  uint16_t recoveryFailures = 0;    // boot/config attempts that failed
+  bool recoveryTerminal = false;    // attempts exhausted; manual recover only
+  ErrorCode lastRecoveryReason = ErrorCode::None;
+  uint32_t lastRecoveryUs = 0;
+
+  // Output. `outputEnabled` is false when binary output was not requested or
+  // no sink was supplied. The counters make loss unambiguous: suppressed
+  // frames were never expected on the wire; every other dropped frame was.
+  bool outputEnabled = false;
+  uint32_t framesWritten = 0;
+  uint32_t framesSuppressed = 0;
+  uint32_t framesTooLarge = 0;
+  uint32_t framesNoCapacity = 0;
+  uint32_t framesPartial = 0;
+  uint32_t framesFailed = 0;
+  uint32_t framesDropped = 0;       // tooLarge + noCapacity + partial + failed
+  ErrorCode lastOutputError = ErrorCode::None;
+  uint32_t lastOutputErrorUs = 0;
+
   // Timing (microseconds, host clock)
   uint32_t lastIntUs = 0;
   uint32_t lastReportUs = 0;
@@ -243,11 +268,25 @@ struct Diagnostics {
 // Configuration
 // ---------------------------------------------------------------------------
 struct RecoveryPolicy {
-  uint8_t maxAttempts = 5;
+  uint8_t maxAttempts = 5;          // consecutive automatic attempts
   uint16_t backoffMs[5] = {250, 500, 1000, 2000, 4000};
   uint16_t bootTimeoutMs = 300;     // datasheet: 94 ms typical
   uint16_t commandTimeoutMs = 100;  // per SH-2 request
   bool resetOnBootTimeout = true;
+
+  // Automatic recovery is bounded to maxAttempts. A successful init resets
+  // the attempt counter. Set autoRecover = false to require a manual call.
+  bool autoRecover = true;
+  // Consecutive SPI/protocol errors while Streaming before a recovery starts.
+  // Counters reset on a clean transfer, so isolated errors do not reset the
+  // device.
+  uint8_t transientErrorThreshold = 3;
+  // How long to stay Degraded (after the report-silence window) before
+  // starting a recovery. 0 disables silence-triggered recovery.
+  uint16_t silenceRecoveryMs = 2000;
+  // Manual recover() calls closer together than this are rate-limited. This
+  // stops an application loop from thrashing the device.
+  uint16_t manualRecoverIntervalMs = 1000;
 
   uint16_t backoffForAttempt(uint8_t attempt) const {
     if (attempt == 0) return backoffMs[0];

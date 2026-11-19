@@ -96,6 +96,37 @@ class BufferSink : public bno085::IOutputSink {
   void clear() { bytes.clear(); }
 };
 
+// Sink with controllable capacity and write behaviour. It is the host-side
+// abstraction boundary for the Arduino Stream sink: the real HardwareSerial
+// reports free TX-ring space and does not report short writes, so these knobs
+// test the encoder contract rather than the UART driver.
+class CapacitySink : public bno085::IOutputSink {
+ public:
+  size_t capacity = npos;       // npos = report "unlimited"
+  size_t accept = npos;         // npos = accept the whole frame
+  size_t forcedReturn = npos;   // npos = return the accepted count
+  size_t writeCalls = 0;
+  size_t lastLen = 0;
+  std::vector<uint8_t> bytes;
+
+  size_t availableForWrite() const override { return capacity; }
+
+  size_t write(const uint8_t* data, size_t len) override {
+    ++writeCalls;
+    lastLen = len;
+    const size_t n = (accept == npos) ? len : ((accept < len) ? accept : len);
+    bytes.insert(bytes.end(), data, data + n);
+    if (forcedReturn != npos) return forcedReturn;
+    return n;
+  }
+
+  void clear() {
+    bytes.clear();
+    writeCalls = 0;
+    lastLen = 0;
+  }
+};
+
 } // namespace test
 
 #endif // BNO085_TEST_MOCK_HAL_H

@@ -30,12 +30,15 @@ is what the hardware bring-up checklist is for.
 | --- | --- |
 | CRC | CCITT-FALSE check value `0x29B1`, incremental chaining |
 | Frame encoder | 34-byte quaternion frame, field offsets, CRC range, corruption detection |
+| Output loss | success, full sink (atomic drop), zero-byte write, partial write, no sink (suppressed, no sequence consumed), drop-then-recovery with a consumer-visible sequence gap |
 | SHTP accept | valid rotation-vector transfer, reception timestamp propagation, sequence gap counting |
 | SHTP reject | no data, zero length, short fragment, reserved length, bad channel, oversize transfer, payload larger than payload buffer, unexpected continuation, bus error |
 | SHTP oversize drain | 552-byte advertisement consumed completely (nothing stranded, device idle afterwards), oversized continuation chain drained fragment by fragment, report arriving right after an oversize still decodes |
 | SH-2 control | product id (4/5 entry forms), set-feature complete 21-byte frame and second-frame sequence, hub rejection, command timeout, reset-complete |
 | SH-2 reports | RV decode (Q14 + accuracy), delay ticks and timestamp reconstruction, `0xFB`/`0xFA` per-payload delta (known example, zero fallback, host-counter wrap, negative-result low 32 bits), duplicate suppression, report gaps, unknown report id |
 | Sensor FSM | full boot → identify → configure → get-feature → streaming, boot timeout, unsupported report rejection, recovery from a malformed transfer, recovery backoff |
+| Sensor recovery | boot-timeout recovery success, bounded backoff sequence, attempt exhaustion → terminal `Failed`, no bus traffic in terminal state, manual recovery after terminal failure, rate limiting |
+| Sensor fault triggers | consecutive SPI transfer failures, report silence → `Degraded` → recovery, output sink full/unavailable counters, polling observation timestamp shared across one drain |
 
 ## Running
 
@@ -52,6 +55,9 @@ sh test/native/build_gcc.sh
 ```
 
 Both print `RESULT: PASS` and exit non-zero on failure.
+
+The current suite is 54 cases / 348 checks. Counts in this file are exact only for the
+run recorded in `output.md`; add cases rather than trimming them when extending coverage.
 
 ## Known non-goals
 

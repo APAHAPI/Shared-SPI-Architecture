@@ -227,6 +227,49 @@ struct SensorFixture {
   }
 };
 
+// Runs the normal boot exchange. The mock clock does not advance, so every
+// deadline is far away and each update performs exactly one stage.
+void driveSensorToStreaming(SensorFixture& fx) {
+  CHECK(fx.sensor.begin(fx.manager, fx.config, 0).ok());
+
+  fx.hal.queuePacket(makePacket(0, 0, std::vector<uint8_t>(8, 0x42)));
+  fx.hal.queuePacket(makePacket(1, 0, std::vector<uint8_t>(1, 0x01)));
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Identifying);
+
+  fx.hal.queuePacket(makePacket(2, 0, makeProductId(10004158u, 1u, 2, 3, 1)));
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Configuring);
+
+  fx.sensor.update();  // set-feature (completes on send)
+  fx.sensor.update();  // -> StageGetFeature
+  fx.sensor.update();  // get-feature request
+
+  fx.hal.queuePacket(makePacket(2, 1, makeGetFeatureResponse(0x05, 10000)));
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Streaming);
+}
+
+// Boot exchange after startBoot() has already run; the sensor is Booting.
+void finishBootToStreaming(SensorFixture& fx) {
+  fx.hal.queuePacket(makePacket(0, 0, std::vector<uint8_t>(8, 0x42)));
+  fx.hal.queuePacket(makePacket(1, 0, std::vector<uint8_t>(1, 0x01)));
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Identifying);
+
+  fx.hal.queuePacket(makePacket(2, 0, makeProductId(10004158u, 1u, 2, 3, 1)));
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Configuring);
+
+  fx.sensor.update();
+  fx.sensor.update();
+  fx.sensor.update();
+
+  fx.hal.queuePacket(makePacket(2, 1, makeGetFeatureResponse(0x05, 10000)));
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Streaming);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -285,6 +328,99 @@ void testEncoderQuaternionFrame() {
   corrupted[20] ^= 0xFF;
   CHECK(bno085::crc16CcittFalse(&corrupted[2], 6 + 24) !=
         bno085::sh2::readU16(&corrupted[32]));
+}
+
+// Every output outcome must be distinguishable. The mock sink is the host-side
+// abstraction of the Arduino Stream contract: capacity is reported before the
+// write, and the write may accept less than requested.
+void testEncoderOutputOutcomes() {
+  bno085::BinaryEncoder encoder;
+  test::CapacitySink sink;
+  encoder.attach(&sink, nullptr);
+  bno085::Quaternion q;
+
+  // Success.
+  CHECK(encoder.writeQuaternion(0, q));
+  CHECK(encoder.lastResult() == bno085::BinaryEncoder::EmitResult::Ok);
+  CHECK(encoder.framesWritten() == 1);
+  CHECK(encoder.framesDropped() == 0);
+  CHECK(encoder.sequence() == 1);
+  CHECK(sink.writeCalls == 1);
+  CHECK(sink.bytes.size() == 34);
+
+  // Insufficient capacity: atomic drop, no bytes written, but a real attempt
+  // consumes a frame sequence number.
+  sink.clear();
+  sink.capacity = 33;
+  CHECK(!encoder.writeQuaternion(0, q));
+  CHECK(encoder.lastResult() == bno085::BinaryEncoder::EmitResult::NoCapacity);
+  CHECK(sink.writeCalls == 0);
+  CHECK(sink.bytes.empty());
+  CHECK(encoder.framesNoCapacity() == 1);
+  CHECK(encoder.framesDropped() == 1);
+  CHECK(encoder.sequence() == 2);
+
+  // Zero-byte write (sink accepted nothing).
+  sink.capacity = bno085::IOutputSink::npos;
+  sink.accept = 0;
+  sink.forcedReturn = 0;
+  CHECK(!encoder.writeQuaternion(0, q));
+  CHECK(encoder.lastResult() ==
+        bno085::BinaryEncoder::EmitResult::FailedWrite);
+  CHECK(sink.bytes.empty());
+  CHECK(encoder.framesFailed() == 1);
+  CHECK(encoder.sequence() == 3);
+
+  // Partial write: the prefix is visible to the consumer and must be counted.
+  sink.clear();
+  sink.accept = 10;
+  sink.forcedReturn = bno085::IOutputSink::npos;
+  CHECK(!encoder.writeQuaternion(0, q));
+  CHECK(encoder.lastResult() ==
+        bno085::BinaryEncoder::EmitResult::PartialWrite);
+  CHECK(sink.bytes.size() == 10);
+  CHECK(encoder.framesPartial() == 1);
+  CHECK(encoder.sequence() == 4);
+  CHECK(encoder.framesWritten() == 1);
+  CHECK(encoder.framesDropped() == 3);
+}
+
+void testEncoderDropThenRecovery() {
+  bno085::BinaryEncoder encoder;
+  test::CapacitySink sink;
+  encoder.attach(&sink, nullptr);
+  bno085::Quaternion q;
+
+  // Three full-sink attempts, then capacity returns for the fourth frame.
+  sink.capacity = 0;
+  CHECK(!encoder.writeQuaternion(0, q));
+  CHECK(!encoder.writeQuaternion(0, q));
+  CHECK(!encoder.writeQuaternion(0, q));
+  CHECK(encoder.framesNoCapacity() == 3);
+  CHECK(encoder.framesDropped() == 3);
+  CHECK(encoder.sequence() == 3);
+
+  sink.capacity = bno085::IOutputSink::npos;
+  CHECK(encoder.writeQuaternion(0, q));
+  CHECK(encoder.framesWritten() == 1);
+  CHECK(encoder.framesDropped() == 3);  // historical counters keep the loss
+  CHECK(sink.bytes.size() == 34);
+  CHECK(bno085::sh2::readU16(&sink.bytes[6]) == 3);  // consumer-visible gap
+
+  // No sink is an intentional suppression, not loss: no sequence is consumed.
+  bno085::BinaryEncoder quiet;
+  quiet.attach(nullptr, nullptr);
+  CHECK(!quiet.writeQuaternion(0, q));
+  CHECK(quiet.lastResult() ==
+        bno085::BinaryEncoder::EmitResult::Suppressed);
+  CHECK(quiet.framesSuppressed() == 1);
+  CHECK(quiet.framesDropped() == 0);
+  CHECK(quiet.sequence() == 0);
+
+  test::CapacitySink later;
+  quiet.attach(&later, nullptr);
+  CHECK(quiet.writeQuaternion(0, q));
+  CHECK(bno085::sh2::readU16(&later.bytes[6]) == 0);  // no gap after suppression
 }
 
 void testShtpValidRotationVector() {
@@ -801,10 +937,216 @@ void testSensorBootTimeout() {
   SensorFixture fx;
   CHECK(fx.sensor.begin(fx.manager, fx.config, 0).ok());
   CHECK(fx.sensor.state() == bno085::State::Booting);
+
   fx.hal.advance(400000);  // beyond the 300 ms boot budget
   fx.sensor.update();
-  CHECK(fx.sensor.state() == bno085::State::Failed);
+
+  // A boot timeout is recoverable: the sensor waits out the first backoff.
+  CHECK(fx.sensor.state() == bno085::State::Recovering);
   CHECK(fx.sensor.lastError() == bno085::ErrorCode::BootTimeout);
+  CHECK(fx.sensor.diagnostics().lastRecoveryReason ==
+        bno085::ErrorCode::BootTimeout);
+  CHECK(fx.sensor.diagnostics().recoveryAttempts == 1);
+  CHECK(fx.sensor.diagnostics().recoveryFailures == 1);
+  CHECK(!fx.sensor.diagnostics().recoveryTerminal);
+}
+
+void testSensorRecoverySucceeds() {
+  SensorFixture fx;
+  CHECK(fx.sensor.begin(fx.manager, fx.config, 0).ok());
+  fx.hal.advance(400000);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Recovering);
+
+  // Backoff is bounded: still waiting one microsecond early.
+  fx.hal.advance(249999);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Recovering);
+  fx.hal.advance(1);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Booting);
+
+  finishBootToStreaming(fx);
+  CHECK(fx.sensor.diagnostics().recoverySuccesses == 1);
+  CHECK(fx.sensor.diagnostics().recoveryAttempts == 0);
+  CHECK(!fx.sensor.diagnostics().recoveryTerminal);
+}
+
+void testSensorRecoveryExhaustsAndTerminates() {
+  SensorFixture fx;
+  CHECK(fx.sensor.begin(fx.manager, fx.config, 0).ok());
+
+  const uint16_t backoffMs[5] = {250, 500, 1000, 2000, 4000};
+  for (uint8_t i = 0; i < 5; ++i) {
+    fx.hal.advance(400000);  // fail the boot window
+    fx.sensor.update();
+    CHECK(fx.sensor.state() == bno085::State::Recovering);
+    CHECK(fx.sensor.diagnostics().recoveryAttempts == i + 1);
+
+    // The retry must not happen before its backoff elapses.
+    fx.hal.advance(static_cast<uint32_t>(backoffMs[i]) * 1000u - 1u);
+    fx.sensor.update();
+    CHECK(fx.sensor.state() == bno085::State::Recovering);
+    fx.hal.advance(1);
+    fx.sensor.update();
+    CHECK(fx.sensor.state() == bno085::State::Booting);
+  }
+
+  const uint32_t callsBefore = fx.hal.transferCalls;
+  fx.hal.advance(400000);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Failed);
+  CHECK(fx.sensor.diagnostics().recoveryTerminal);
+  CHECK(fx.sensor.diagnostics().recoveryFailures == 6);
+  CHECK(fx.sensor.diagnostics().lastRecoveryReason ==
+        bno085::ErrorCode::BootTimeout);
+
+  // A terminal failure does not hang the caller: update() is still cheap and
+  // must not touch the bus.
+  fx.hal.advance(1000000);
+  fx.sensor.update();
+  CHECK(fx.hal.transferCalls == callsBefore);
+}
+
+void testSensorManualRecoveryAfterTerminal() {
+  SensorFixture fx;
+  CHECK(fx.sensor.begin(fx.manager, fx.config, 0).ok());
+
+  const uint16_t backoffMs[5] = {250, 500, 1000, 2000, 4000};
+  for (uint8_t i = 0; i < 5; ++i) {
+    fx.hal.advance(400000);
+    fx.sensor.update();
+    fx.hal.advance(static_cast<uint32_t>(backoffMs[i]) * 1000u);
+    fx.sensor.update();
+  }
+  fx.hal.advance(400000);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Failed);
+
+  CHECK(fx.sensor.recover().ok());
+  CHECK(fx.sensor.state() == bno085::State::Recovering);
+  CHECK(!fx.sensor.diagnostics().recoveryTerminal);
+  CHECK(fx.sensor.diagnostics().recoveryAttempts == 1);
+
+  const bno085::Status second = fx.sensor.recover();
+  CHECK(second.code == bno085::Status::RecoveryRateLimited);
+
+  fx.hal.advance(250000);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Booting);
+  finishBootToStreaming(fx);
+  CHECK(fx.sensor.state() == bno085::State::Streaming);
+  CHECK(fx.sensor.diagnostics().recoverySuccesses == 1);
+}
+
+void testSensorTransportFailureTriggersRecovery() {
+  SensorFixture fx;
+  driveSensorToStreaming(fx);
+
+  fx.hal.intState = true;
+  fx.hal.failTransfers = true;
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Streaming);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Streaming);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Recovering);
+  CHECK(fx.sensor.diagnostics().lastRecoveryReason ==
+        bno085::ErrorCode::SpiRead);
+  CHECK(fx.sensor.diagnostics().recoveryFailures == 1);
+
+  fx.hal.failTransfers = false;
+  fx.hal.intState = false;
+  fx.hal.advance(250000);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Booting);
+
+  finishBootToStreaming(fx);
+  CHECK(fx.sensor.state() == bno085::State::Streaming);
+  CHECK(fx.sensor.diagnostics().recoverySuccesses == 1);
+}
+
+void testSensorSilenceTriggersRecovery() {
+  SensorFixture fx;
+  driveSensorToStreaming(fx);
+
+  fx.hal.advance(100000);  // beyond the report-silence window (75 ms)
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Degraded);
+  CHECK(fx.sensor.diagnostics().lastError == bno085::ErrorCode::NoReports);
+
+  // Degraded is not terminal: stay silent long enough to start recovery.
+  fx.hal.advance(2000000);
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Recovering);
+  CHECK(fx.sensor.diagnostics().lastRecoveryReason ==
+        bno085::ErrorCode::NoReports);
+}
+
+void testSensorOutputDropsAreObservable() {
+  SensorFixture fx;
+  test::CapacitySink capped;
+  capped.capacity = 0;  // sink is permanently full for this test
+  fx.manager.output = &capped;
+
+  CHECK(fx.sensor.begin(fx.manager, fx.config, 0).ok());
+  CHECK(fx.sensor.diagnostics().outputEnabled);
+  CHECK(fx.sensor.diagnostics().framesNoCapacity == 1);  // hello
+
+  finishBootToStreaming(fx);
+  CHECK(fx.sensor.diagnostics().framesWritten == 0);
+  CHECK(fx.sensor.diagnostics().framesNoCapacity >= 2);  // + init result
+  CHECK(fx.sensor.diagnostics().framesDropped ==
+        fx.sensor.diagnostics().framesNoCapacity);
+  CHECK(fx.sensor.diagnostics().lastOutputError ==
+        bno085::ErrorCode::OutputOverflow);
+
+  // The sink recovers; the next report is emitted with a sequence gap that
+  // reflects every dropped attempt.
+  const uint32_t droppedBefore = fx.sensor.diagnostics().framesNoCapacity;
+  capped.capacity = bno085::IOutputSink::npos;
+  fx.hal.queuePacket(
+      makePacket(3, 0, makeRotationVector(1, 4096, 0, 0, 15872, 3, 0, 0)));
+  fx.sensor.update();
+
+  CHECK(fx.sensor.diagnostics().framesWritten == 1);
+  CHECK(fx.sensor.diagnostics().framesNoCapacity == droppedBefore);
+  CHECK(capped.bytes.size() == 34);
+  CHECK(bno085::sh2::readU16(&capped.bytes[6]) == droppedBefore);
+}
+
+void testSensorOutputUnavailableIsReported() {
+  SensorFixture fx;
+  fx.manager.output = nullptr;
+  fx.manager.emitBinaryFrames = true;
+
+  CHECK(fx.sensor.begin(fx.manager, fx.config, 0).ok());
+  CHECK(!fx.sensor.diagnostics().outputEnabled);
+  CHECK(fx.sensor.diagnostics().lastOutputError ==
+        bno085::ErrorCode::OutputUnavailable);
+  CHECK(fx.sensor.diagnostics().framesDropped == 0);  // nothing was expected
+}
+
+void testSensorObservationTimestampSharedByDrain() {
+  SensorFixture fx;
+  driveSensorToStreaming(fx);
+
+  // Two reports queued; one update drains both and stamps them with the same
+  // polled INT observation time, not the physical edge time.
+  fx.hal.queuePacket(
+      makePacket(3, 0, makeRotationVector(1, 0, 0, 0, 16384, 3, 10, 0)));
+  fx.hal.queuePacket(
+      makePacket(3, 1, makeRotationVector(2, 0, 0, 0, 16384, 3, 20, 0)));
+  const uint32_t observedAt = fx.hal.clockUs;
+  fx.sensor.update();
+
+  CHECK(fx.sensor.diagnostics().reportsDecoded == 2);
+  bno085::Quaternion q;
+  CHECK(fx.sensor.latest(q));
+  CHECK(q.seq == 2);
+  CHECK(q.tHostUs == observedAt);
+  // tMeas is still the hub measurement time (0 + 20 ticks * 100 us).
+  CHECK(q.tMeasUs == observedAt + 2000);
 }
 
 void testSensorRejectsUnsupportedReport() {
@@ -869,6 +1211,8 @@ int main() {
   const TestCase tests[] = {
       {"crc16_known_vector", testCrc16},
       {"encoder_quaternion_frame", testEncoderQuaternionFrame},
+      {"encoder_output_outcomes", testEncoderOutputOutcomes},
+      {"encoder_drop_then_recovery", testEncoderDropThenRecovery},
       {"shtp_valid_rotation_vector", testShtpValidRotationVector},
       {"shtp_no_data", testShtpNoData},
       {"shtp_zero_length", testShtpZeroLengthIsSpurious},
@@ -908,6 +1252,14 @@ int main() {
       {"sh2_reset_complete", testSh2ResetComplete},
       {"sensor_init_sequence", testSensorInitializationSequence},
       {"sensor_boot_timeout", testSensorBootTimeout},
+      {"sensor_recovery_succeeds", testSensorRecoverySucceeds},
+      {"sensor_recovery_exhausts", testSensorRecoveryExhaustsAndTerminates},
+      {"sensor_manual_recovery", testSensorManualRecoveryAfterTerminal},
+      {"sensor_transport_recovery", testSensorTransportFailureTriggersRecovery},
+      {"sensor_silence_recovery", testSensorSilenceTriggersRecovery},
+      {"sensor_output_drops", testSensorOutputDropsAreObservable},
+      {"sensor_output_unavailable", testSensorOutputUnavailableIsReported},
+      {"sensor_observation_timestamp", testSensorObservationTimestampSharedByDrain},
       {"sensor_rejects_grv", testSensorRejectsUnsupportedReport},
       {"sensor_survives_malformed", testSensorSurvivesMalformedPacket},
       {"sensor_recover_backoff", testSensorRecoverBackoff},

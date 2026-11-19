@@ -17,8 +17,9 @@ class of bug is otherwise easy to reintroduce.
    the layers above it (table in §5).
 3. **Every wait has a deadline.** No `while (!ready)` without an elapsed-time test and a
    failure exit. Every loop increments a counter that is visible in diagnostics.
-4. **No SPI inside an interrupt handler.** The ISR does two things: capture `micros()`
-   and set a bit in an atomic mask.
+4. **No SPI inside an interrupt handler.** Phase 1 uses no ISR: `update()` polls
+   H_INTN with `digitalRead` and latches the first-observation `micros()`. If a later
+   phase adds an ISR, it may only capture `micros()` and set an atomic bit.
 5. **CS is deasserted on every exit path**, including early return and error, via an
    RAII guard around the transaction.
 6. **The bus is never held across a USB write**, a `delay()`, or a callback into
@@ -189,6 +190,16 @@ bytes to learn how many clocks are needed, then repeat the read for the full tra
 The header is therefore transmitted twice, which costs 4 wire bytes per transfer
 (accounted for in the bandwidth numbers).
 
+**Phase 1 implementation note.** There is no ISR. `Sensor::serviceBus()` polls
+`IHal::intAsserted()`; on the rising observation it latches `intEdgeUs_ = micros()`.
+Every packet drained during that visit — including all fragments of one payload — uses
+that single observation time as `tHostUs`. The physical H_INTN edge may be earlier by
+up to one `update()` interval. `tMeas` arithmetic is unchanged: it uses the observation
+time minus the hub reference plus the delay field. This is deliberate Option A
+(polling): it removes ISR races on a shared bus while keeping the timestamp domains
+distinct and documented. Option B (minimal ISR edge capture) remains a Phase 2
+candidate if hardware measurements show the polling latency matters.
+
 ### 4.3 Output path
 
 ```
@@ -200,6 +211,13 @@ Draining happens only when the bus is released, so a slow or blocking USB write 
 delay an interrupt service (the BNO085 deasserts INT and retries if the host takes
 longer than ~10 ms — datasheet §1.2.4.1 — so bus latency is a correctness property,
 not just performance).
+
+**Phase 1 implementation note.** There is no aggregator queue yet. A completed payload
+is decoded and the quaternion frame is offered to the sink from inside the SHTP handler,
+after the SPI body transfer and its CS release have returned. The encoder asks for free
+sink capacity first and drops the frame atomically when it does not fit, so the serial
+write is bounded and never holds the bus or CS. Loss is counted per cause and exposed in
+`Diagnostics`; see API §4.11.
 
 ### 4.4 Where CPU time goes
 
@@ -302,21 +320,33 @@ interleaving a transaction with a sensor read.
 
 ### 6.4 Interrupt path
 
+Phase 1 (implemented) has no interrupt handler:
+
 ```
-attachInterrupt(digitalPinToInterrupt(intPin), isr, FALLING)
-ISR: pendingMask |= bit; edgeUs[i] = micros();
+update() ─► asserted = hal.intAsserted()          // digitalRead(INT) == LOW
+            if asserted and not already pending:
+                intPending = true; intEdgeUs = micros()
+            drain up to maxTransfersPerVisit transfers, all stamped intEdgeUs
+            if INT deasserted: intPending = false
 ```
 
-- The mask is a single `uint32_t` accessed atomically (20 sensors < 32 bits).
-- `micros()` in an ISR is safe on ESP32 and gives the reception timestamp the
-  datasheet's timing model expects (host timestamps at H_INTN assertion).
-- **Level re-check:** because H_INTN is level-asserted until CS is observed, each
-  `update()` also samples `digitalRead(intPin) == LOW` for sensors in `Streaming`.
-  This recovers from a missed edge without any ISR work.
-- No-INT configuration (`intPin == -1`) is supported: the sensor is polled on a
-  schedule derived from its report interval.
+- **Observation time, not edge time.** `intEdgeUs` is when the loop observed the level,
+  so it lags the physical falling edge by up to one loop period. This is documented in
+  `Quaternion::tHostUs` and in API §2.5.
+- **Level, not edge.** Because H_INTN stays asserted until CS is observed, polling the
+  level cannot miss a pending transfer. A spurious assertion is counted and released.
+- **No SPI in an ISR.** Nothing runs in interrupt context, so the shared bus is never
+  touched from an ISR.
+- **No-INT configuration** (`intPin == -1`) is supported: `IHal::intAsserted()` returns
+  true so the transport is polled on the sensor's schedule.
+
+A future Phase 2 ISR, if measurements justify it, may only capture `micros()` into a
+per-sensor edge field and set an atomic pending bit. The SPI drain stays in `update()`.
 
 ### 6.5 Round-robin service loop
+
+The multi-sensor loop below is the Phase 2 target. Phase 1 has one sensor and
+`Sensor::update()` performs the equivalent work without a drain queue.
 
 ```
 update():
@@ -352,8 +382,9 @@ Properties:
 | Bus acquire | 2 ms | skip, `busBusy++` |
 | One SPI transaction | fixed by clock rate and byte count (no infinite wait possible) | — |
 | SHTP read | ≤ `BNO085_RX_TRANSFER_BYTES` (256) | reject oversize, count, drain |
-| SH-2 request | 100 ms per command | `SH2_TIMEOUT`, sensor → `Degraded` |
-| Boot wait | 300 ms | recovery attempt |
+| SH-2 request | 100 ms per command | `Sh2Timeout`, recovery starts |
+| Boot wait | 300 ms | `BootTimeout`, recovery attempt |
+| Recovery backoff | 250–4000 ms, bounded attempts | terminal `Failed` |
 | Reset pulse | 1 ms | continue, count |
 
 ---
@@ -385,33 +416,50 @@ reports.
 
 ### 7.3 Failure detection
 
-A sensor is marked `Degraded` when any of these holds:
+A recoverable fault starts the bounded recovery FSM. Classification (implemented):
 
-- no report within `2.5 × interval + 50 ms` while `Streaming`;
-- 3 consecutive SPI transactions returning no valid header;
-- SHTP malformed-packet counter increases (bad channel, bad fragment, oversize,
-  sequence gap beyond threshold);
-- product ID query fails or returns an unrecognised part number at init;
-- the device signals a reset (reset-complete) — reconfigure that device only.
+| Fault | Detected by | Recovery? |
+| --- | --- | --- |
+| SPI transfer failure | `ShtpResult::BusError`; `transientErrorThreshold` consecutive | yes, while streaming |
+| Malformed / repeated oversize SHTP | `ShtpResult::Malformed` / `Oversize`; same threshold | yes, while streaming |
+| Boot window expiry | `StageBoot` deadline (300 ms) | yes |
+| Product-ID / set-feature / get-feature expiry | per-command deadline (`commandTimeoutMs`) | yes |
+| Hub rejects a command | SH-2 `HubError` | yes |
+| Report silence | `2.5 × interval + 50 ms` → `Degraded`; then `silenceRecoveryMs` (default 2 s) | yes |
+| Configuration rejected at `begin()` | `InvalidConfig` / `UnsupportedReport` | no; API error before start |
+| HAL `begin()` failure | returned status | no; terminal without start |
 
-`Degraded` still streams if data arrives; it exists to make recovery decisions
-visible rather than silently retrying.
+A single isolated SPI or protocol error is counted and logged but does not reset the
+device; the consecutive counter is cleared by any clean transfer. `Degraded` still
+accepts reports and returns to `Streaming` by itself if data resumes before the silence
+dwell expires.
 
 ### 7.4 Recovery state machine (per sensor)
 
 ```
-        ┌───────────── Failed ◄── attempts exhausted (default 5)
-        │                 ▲
-Streaming ──fault──► Recovering ──ok──► Reconfiguring ──ok──► Streaming
-                        │  backoff: 250 ms, 500 ms, 1 s, 2 s, 4 s
-                        └─ phase offset = (index × 37 ms)  ← avoids recovery storms
+        ┌──────────── terminal Failed ◄── attempts exhausted (default 5)
+        │
+Streaming/Degraded/init ──recoverable fault──► Recovering
+                                              │ wait backoff: 250,500,1000,2000,4000 ms
+                                              ▼
+                                           Booting ── ok ──► ... ──► Streaming
+                                              │
+                                              └── fault ──► next attempt
 ```
 
-- `recover(i)` is public and callable at any time; it resets the attempt counter.
-- Recovery is independent: no other sensor's state is touched unless resets are
-  physically shared (§7.1).
-- Every attempt emits a `SENSOR_STATUS` and, on final failure, an `ERROR` frame, so the
-  PC sees the failure instead of a silent dropout.
+- `Recovering` performs no SPI and no SH-2 work; it only waits for the backoff deadline,
+  so a failing device cannot monopolise the bus or hang the application.
+- A successful init clears the attempt counter and increments `recoverySuccesses`.
+  Failures increment `recoveryFailures`; when the budget is exhausted the sensor enters
+  terminal `Failed` with `recoveryTerminal = true` and the last real cause (not a
+  synthetic boot timeout).
+- `recover()` is public and callable from any started state. It resets the automatic
+  budget, is rate-limited by `manualRecoverIntervalMs`, returns
+  `Status::RecoveryRateLimited` when called too soon, and returns `InvalidConfig` when
+  the sensor is not started or is disabled.
+- Every terminal transition emits `INIT_RESULT` + `ERROR` when a sink is attached, so
+  the PC sees the failure instead of a silent dropout. Output for these frames is
+  subject to the same capacity/loss accounting as data frames.
 
 ### 7.5 Shared-reset caveat (documented compromise)
 
@@ -432,9 +480,10 @@ architectural points:
 1. **Every record is immutable once enqueued** and carries `sensorId`; the aggregator
    never merges fields from two devices.
 2. **Two timestamps per record.** `tMeasUs` is the device's own measurement time
-   (derived from the host interrupt timestamp and the report's delay field, per
-   datasheet §1.3.5); `tHostUs` is ESP32 `micros()` at INT assertion. The two are
-   different clock domains and are never averaged or substituted.
+   (derived from the host observation timestamp and the report's delay field, per
+   datasheet §1.3.5); `tHostUs` is ESP32 `micros()` when the polling loop first observed
+   H_INTN — not the physical edge and not an ISR capture. The two are different clock
+   domains and are never averaged or substituted.
 3. **No assumption of synchronism.** Records are emitted as they arrive; there is no
    "frame" that waits for all 20 sensors.
 4. **Gaps are counted, not hidden.** Per report ID, an 8-bit `reportSeq` gap increments

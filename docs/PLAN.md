@@ -153,8 +153,9 @@ not an afterthought: it is how framing bugs get caught without a scope.
 Updated after Phase 1. See `PHASE1-NOTES.md` for evidence and the open items.
 
 - **Compiled:** `esp32:esp32:esp32s3` (ESP32 Arduino core 3.3.12), example and
-  diagnostic sketch.
-- **Unit tested:** 30 host cases / 168 checks, 0 failures (MSVC 2022).
+  diagnostic sketch, no warnings with `--warnings all`.
+- **Unit tested:** 54 host cases / 348 checks, 0 failures (MSVC 2022), including bounded
+  automatic recovery, output loss accounting and polling timestamp semantics.
 - **Simulated:** single mock device only; no 20-instance simulation yet.
 - **Hardware validated:** stages 1–2 (bus, CS, SHTP framing, boot 93.7 ms) and the
   oversized-transfer drain (552 B advertisement consumed in 4 bus transactions, stream
@@ -209,7 +210,7 @@ Answers to D1–D4 unblock Phase 1. D5–D7 can be settled during Phase 1–2.
 | 7 | Sensor manager | 2 | Planned |
 | 8 | Data aggregation | 3 | Planned |
 | 9 | Binary output protocol | 3 | Specified in API.md §4 |
-| 10 | Diagnostics and recovery | 2–4 | Planned |
+| 10 | Diagnostics and recovery | 1-4 | Phase 1 has bounded per-sensor recovery and output-loss diagnostics; multi-sensor orchestration is Phase 4 |
 | 11 | Single-sensor example | 1 | Planned |
 | 12 | Dual-sensor example | 2 | Planned |
 | 13 | Configurable multi-sensor example | 5 | Planned |
