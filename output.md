@@ -1,1314 +1,621 @@
-# BNO085Multi — implementation trace and documentation-vs-code audit
+# BNO085Multi — Phase 1 source audit (current HEAD)
 
-**Purpose of this file.** Handoff document for another AI agent. It records what the code in this
-repository actually does, traced from `setup()` through to a decoded Rotation Vector leaving the
-binary output, and lists every place where the implementation differs from the documents in
-`docs/`.
+**Purpose.** Hand-off document for the next agent. It records what the code on the current
+branch actually does, what was executed in this audit, and every place where the
+implementation and the documents disagree.
 
-The file has been through four passes. Pass 1 (§0–§11) traced the implementation and listed
-documentation divergences; it changed no source. Pass 2 (§12) re-derived the five highest-priority
-findings from the source and the reference **without relying on pass 1**, corrected two statements,
-and added per-finding verdicts. Pass 3 (§13) implemented the two highest-priority protocol
-corrections — set-feature payload/completion and timestamp reference/rebase — added regression
-tests, re-ran the host suite and the ESP32-S3 compile, and committed the result. Pass 4 (§14)
-re-verified both protocol areas against the reference, corrected the remaining timestamp
-fallback/clamp divergence, strengthened the set-feature test to a full golden frame, added four
-timestamp regression cases, and re-ran the host suite, the ESP32-S3 compile and MSVC static
-analysis. Pass 4 is **uncommitted**; see §14.7. Where an earlier section still describes pre-fix
-behaviour, that section's status note and **§13/§14** are authoritative.
+> **This file replaces the earlier pass 1–4 narrative.** The old document was anchored to
+> commit `d040c8e`, described pass-4 changes as uncommitted, and kept pre-fix text for
+> set-feature and timestamp handling behind "status" notes. That text is superseded. This
+> audit is derived from the current source at `e9a41ec` and does not rely on the earlier
+> document's conclusions.
 
 | Item | Value |
 | --- | --- |
 | Repository root | `C:\Users\Apahapi\Desktop\Source codes\Shared SPI Architecture` |
-| Library name / version | `BNO085Multi` 0.1.0 (`library.properties`) |
-| Analysed commit | `d040c8e` — "Drain oversized SHTP transfers completely" (`git log --oneline`) |
-| Pass-2 document commit | `5ce28fe` — "Update output.md"; `src/` unchanged since `d040c8e` |
-| Pass-3 code/test commit | `25deebf` — "Fix SH-2 set-feature payload and timestamp reconstruction" |
-| Pass-4 state | Working tree on `91e537d`, **not committed** (§14) |
+| Branch | `main`, up to date with `origin/main` |
+| HEAD | `e9a41eca6b77e947840708d67bd7d15fe164a359` — "Match SH-2 timestamp reference semantics" |
+| Working tree at audit start | clean (no modified, staged or untracked source files) |
+| Library / version | `BNO085Multi` 0.1.0 (`library.properties`) |
 | Stage | Phase 1 — single-sensor baseline, ESP32-S3, Arduino core 3.3.12 |
-| Analysis date | 2026-11-17 (passes 1–3); 2026-11-18 (pass 4) |
-| Authoritative sources for this file | The source files themselves. Protocol comparisons were checked against the Hillcrest/CEVA reference `sh2.c`, downloaded for pass 2 to `%TEMP%\sh2_ref.c` (Adafruit mirror; the same upstream that `docs/UPSTREAM-AUDIT.md` analyses). |
-| Files read | `README.md`; `docs/{ARCHITECTURE,API,PHASE1-NOTES,UPSTREAM-AUDIT}.md`; `src/BNO085Multi.h`, `BNO085Config.h`, `BNO085Types.{h,cpp}`, `BNO085Sensor.{h,cpp}`; `src/hal/{IHal.h,SpibusManager.*,Esp32SpiHal.*}`; `src/shtp/{ShtpProtocol.h,ShtpTransport.*}`; `src/sh2/{Sh2Codes.*,Sh2Client.*,Sh2Reports.*}`; `src/output/{OutputProtocol.h,IOutputSink.h,BinaryEncoder.*,ArduinoSink.h}`; `src/util/Crc16.*`; `src/diag/Logger.h`; `examples/01_SingleSensor/01_SingleSensor.ino`; `test/native/{test_main.cpp,mock_hal.h}` |
+| Audit date | 2026-11-19 |
+| Source changes in this audit | **none** |
+| Document changes in this audit | this file only |
+| Hardware | ESP32-S3 and BNO085 **disconnected**; COM11 unavailable. No physical evidence was produced or re-used as new evidence. |
 
-> Note for the next agent: the claims below are anchored to file + line numbers at commit
-> `d040c8e`. Re-read the cited functions before editing; line numbers will drift after changes.
->
-> **Pass-2 corrections to keep in mind while reading §0–§11:**
-> - `0xFA`/`0xFB` arriving on channels 3/4 do **not** abort parsing of the rest of the payload.
->   Both IDs have entries in `kReportLengths` (`Sh2Codes.cpp:62–63`, length 5), so they are
->   length-skipped and passed to the null `sensorReport` handler. They are silently ignored, not
->   parse-terminating. (§4.5 and §9.3 item 17 overstate this.)
-> - “Set-feature is likely to time out on real hardware” is a **hypothesis**, not a measurement.
->   The code/reference divergence is certain; the hub's actual `0xF1` behaviour is unproven. See
->   §12.2.
-> - Two defects missing from §9.3 are recorded there now as items 18–19 (recovery attempt counter;
->   `dropped_` counts writes that were never supposed to happen).
+**Evidence classes used below.** Every claim is labelled as one of: *source-verified* (read
+from the current tree), *host-tested* (executed in this audit), *historical* (recorded in the
+repository before this audit, not re-executed), or *unverified* (requires hardware or a
+toolchain that is not present).
 
 ---
 
-## 0. What this project is (one paragraph)
+## 1. Verdict summary
 
-An Arduino library for an ESP32-S3 that drives 1–20 BNO085 IMUs on one shared SPI bus. The
-BNO085 does its own sensor fusion; the firmware moves bytes, keeps per-device state, timestamps
-reports and emits a CRC-framed binary stream. Phase 1 implements one sensor only, Rotation Vector
-only, and has no `Manager`, no aggregation, no interrupt handler and no automatic recovery.
-
----
-
-## 1. Object graph as actually built
-
-There is no `Manager` class in `src/`. One `Sensor` owns one HAL reference and all per-device state:
-
-```
-StreamSink / NullOutputSink ──► BinaryEncoder (member of Sensor)
-Sensor ──owns── ShtpTransport ──owns── rx/tx buffers, per-channel seq, reassembly
-       └─owns── Sh2Client    ──owns── product, pending requests, deadlines, rebase, epoch
-       └─ref─── IHal (Esp32SpiHal) ──ref── SpiBusManager (the only shared object)
-```
-
-Wiring happens in `Sensor::begin()` (`src/BNO085Sensor.cpp:22`):
-
-- `shtp_.attach(&hal_, &log_, index_)` and `shtp_.setHandler(&Sensor::channelThunk, this)` — lines 58–59
-- `sh2_.attach(&shtp_, &log_, index_)`, `setTimeoutMs(manager_.recovery.commandTimeoutMs)`,
-  `setHandlers(...)` — lines 61–68
-- `encoder_.attach(manager_.emitBinaryFrames ? output_ : nullptr, &log_)` — line 56
-- `hal_.begin()` — line 70
-- `encoder_.writeHello(1, 0x0001, hal_.timeUs())` — line 85 (sensor count is hardcoded to 1)
-- `startBoot()` — line 94
-
----
-
-## 2. Initialization, step by step
-
-| Step | File / function | Caller → callee | What happens next |
-| --- | --- | --- | --- |
-| 1 | `Sensor::begin` (`BNO085Sensor.cpp:22–96`) | sketch → `Sensor` | Validates only `csPin >= 0`, `report == RotationVector`, `intervalUs >= kMinIntervalUs && reportsValid()`, `0 < spiHz <= 3 MHz` (lines 32–49). No duplicate-pin, sensor-count or `resetGroup` validation. |
-| 2 | `Esp32SpiHal::begin` (`hal/Esp32SpiHal.cpp:22–55`) | Sensor → HAL → `SpiBusManager::begin` | Bus/driver init once (`SpiBusManager.cpp:17–45`), CS driven high, INT as `INPUT_PULLUP`, RST/WAKE driven high. |
-| 3 | `BinaryEncoder::writeHello` (`output/BinaryEncoder.cpp:67–77`) | Sensor | First bytes on the sink: `A5 5A 01 7F 0A 00 <seq> …`; flags `0x0009` (binary, reception timestamps). |
-| 4 | `Sensor::startBoot` (`104–137`) | Sensor | `shtp_.reset()` + `sh2_.reset()`, `stage_=StageBoot`, `state_=Booting`, `bootPacketBaseline_ = shtp_.stats().packets`, deadline `now + bootTimeoutMs` (default 300 ms). `hal_.pulseReset()` if `resetPin >= 0` (NRST low 10 µs, `delay(1)`, high). If no reset pin **and** recovering, `sh2_.sendReset()` on executable channel 1 with byte `0x01`. |
-| 5 | `Sensor::update` → `serviceBus` → `ShtpTransport::service` | sketch loop | Any **complete** SHTP packet increments `stats_.packets`; `advanceInit` sees `packets > baseline` and moves to `StageIdentify` (`225–237`). The 552-byte advertisement takes the `Oversize` path and does **not** increment `packets`, so it is the following reset-complete packet that advances the stage. |
-| 6 | `StageIdentify` (`240–256`) | `advanceInit` → `Sh2Client::requestProductIds` | Sends `F9 00` on control channel every 10 ms while not busy; advances as soon as `productInfo().valid` is set by the **first** `0xF8`. |
-| 7 | `StageSetFeature` (`258–282`) | → `Sh2Client::setFeature` | Sends one 17-byte `0xFD` payload; waits for `cmdState() == Ok` (from an `0xF1` response). On Ok → `StageGetFeature`. See §4 for the wire bytes and a serious defect. |
-| 8 | `StageGetFeature` (`284–298`) | → `Sh2Client::getFeature` | Sends `FE 05`; a `0xFC` response stores `grantedIntervalUs_` and sets `Ok`; `enterStreaming()` (`309–327`) sets `State::Streaming`, emits `INIT_RESULT` (result 0). |
-
-`Sensor::update()` order (`139–163`): `serviceBus`, then `Sh2Client::pollTimeouts`, then
-`advanceInit`, then `checkSilence`, then `emitStatusIfDue`. Responses therefore win ties against
-deadlines in the same update.
-
----
-
-## 3. INT handling and SHTP reading (as implemented)
-
-### 3.1 INT: polling, no ISR
-
-`Esp32SpiHal::intAsserted()` (`Esp32SpiHal.cpp:91–95`) is a `digitalRead(intPin) == LOW`. With
-`intPin < 0` it returns `true` so the sensor is polled every `update()`. There is **no**
-`attachInterrupt`, no ISR, no pending mask.
-
-`Sensor::serviceBus` (`165–220`):
-
-1. Poll `intAsserted()`. On first observation while `!intPending_`, latch `intPending_ = true`
-   and `intEdgeUs_ = nowUs`; `++diag_.intAssertions` (166–174).
-2. The latch is **not** re-stamped while it stays pending, so every packet drained in that visit
-   carries the time of first observation.
-3. Loop while `intPending_`, `visits < manager_.maxTransfersPerVisit` (default 3) and
-   `timeUs() - nowUs <= serviceBudgetUs` (default 2 ms), calling `shtp_.service(intEdgeUs_)`
-   (188–217).
-4. After each call the latch is cleared if INT reads high. `NoData`/`Spurious`/`BusError` also
-   clear it; `Malformed`/`Oversize` leave it set so the loop can continue draining.
-5. `mirrorStats()` copies transport/SH-2 counters into `Diagnostics`.
-
-Consequence: `Quaternion::tHostUs` is the **poll-observation** time, not the hardware H_INTN
-assertion time. Under a busy `loop()`, it can be late by up to one loop period.
-
-### 3.2 SHTP read sequence
-
-`ShtpTransport::service` (`shtp/ShtpTransport.cpp:77–279`):
-
-1. 4-byte peek read: `readRaw(peek, 4)` (81–86). The peek is non-consuming; the device
-   re-presents the whole transfer.
-2. Parse `rawLength` (bit 15 = continuation), `channel = peek[2]`, `sequence = peek[3]` (88–94).
-3. Reject/consume:
-   - `length == 0` → `Spurious` (104–108)
-   - `0xFFFF` reserved → count `badFragments`, `discard(length)` (110–116)
-   - `length < 4` → `shortFragments` + discard (118–124)
-   - `channel >= 8` → `badChannels` + discard (126–132)
-4. Sequence tracking is diagnostic only (134–144).
-5. `length > 256` (transfer buffer) → `oversizePayloads++`, drain exactly `length` bytes in
-   ≤256-byte chunks following continuation headers, bounded to 8 fragments, return `Oversize`
-   (146–205). This is the fix validated on hardware.
-6. Otherwise read the full `length` bytes (header repeated + payload) into `rxTransfer_` (207),
-   increment `packets`/`bytes`, record `lastChannel/lastLength/lastTimestampUs` (213–217).
-7. Fragment assembly into `rxPayload_` (192 B): a continuation must match an in-progress payload;
-   a new non-continuation transfer aborts a partial assembly and counts `badFragments` (223–263).
-8. When `inRemaining_` reaches 0, call
-   `handler_(context, channel, rxPayload_, inCursor_, inTimestampUs_)` (269–278).
-
-Dispatch: `channelThunk → Sensor::onChannel → Sh2Client::handlePayload`
-(`BNO085Sensor.cpp:421–424`, `Sh2Client.cpp:51–73`):
-
-| Channel | Handler | Result |
-| --- | --- | --- |
-| 0 command/advertisement | logged only | `handlePayload:53–56` |
-| 1 executable | `handleExecutable` → `resetComplete` | `75–96` |
-| 2 SH-2 control | `handleControl` | `98–145` |
-| 3/4 reports | `handleReports` | `274–298` |
-| 5 gyro-RV | logged "ignored" | `67–69` |
-
----
-
-## 4. SH-2: product ID, set/get feature
-
-### 4.1 Product ID (`Sh2Client.cpp:385–397`, `147–184`)
-
-Request payload `{0xF9, 0x00}` on channel 2. Each `0xF8` response is 16 bytes:
-
-```
-report[1] resetCause, [2] major, [3] minor, [4..7] partNumber LE,
-[8..11] buildNumber LE, [12..13] patch LE
-```
-
-The first response sets `product_.valid = true`. `prodExpected_` becomes 5 for part numbers
-10004095 / 10004818 / 10005028, otherwise 4. There is **no** known-good part-number gate;
-`ErrorCode::ProductIdMismatch` is never produced. Because `valid` is set on the first response,
-configuration may begin before all product-ID entries have arrived.
-
-### 4.2 Set feature — wire bytes and a defect
-
-`Sh2Client::setFeature` (`399–433`) builds a 17-byte payload:
-
-```
-[0]=0xFD  [1]=nextCmdSeq_++  [2]=0x00  [3..4]=0
-[5..8]=intervalUs LE  [9..12]=0  [13..16]=0
-```
-
-The `reportId` argument is discarded: `(void)reportId;` at line 431.
-
-Canonical SH-2 `SetFeatureReport_t` (Hillcrest/CEVA `sh2.c`, packed, no sequence, no command byte):
-
-```
-reportId(0xFD), featureReportId, flags, changeSensitivity(u16),
-reportInterval(u32), batchInterval(u32), sensorSpecific(u32)   // 17 bytes
-```
-
-So byte 1 must be the feature report ID (`0x05` for Rotation Vector); the code puts a command
-sequence counter there. The host test enshrines the same wrong bytes
-(`test/native/test_main.cpp:445–464`: 21-byte frame total, interval at `frame[9]`, and
-`frame[5] == 0x00` at line 457). Every other field is at the canonical offset:
-
-| Offset | Implementation | Reference | Verdict |
-| --- | --- | --- | --- |
-| 0 | `0xFD` | `reportId` = `0xFD` | correct |
-| 1 | `nextCmdSeq_++` | `featureReportId` (`0x05`) | **wrong** |
-| 2 | `0x00` | `flags` | correct (no flags requested) |
-| 3–4 | 0 | `changeSensitivity` (u16) | correct |
-| 5–8 | `intervalUs` LE | `reportInterval_uS` (u32) | correct offset/endianness |
-| 9–12 | 0 | `batchInterval_uS` (u32) | correct |
-| 13–16 | 0 | `sensorSpecific` (u32) | correct for RV with no options |
-
-The reference's `sendCtrl` (`sh2.c:668–671`) adds only the 4-byte SHTP header; it does **not**
-insert a command sequence into the payload. This library already has a per-channel SHTP sequence
-(`ShtpTransport::nextOutSeq_`), so `nextCmdSeq_` is a field that does not exist in this report. The
-argument is explicitly discarded at line 431 (`(void)reportId;`), and the log line at 427 prints the
-correct ID while the wire carries something else.
-
-Additionally, `StageSetFeature` waits for an `0xF1` command response for `0xFD` (`267–274`). The
-reference SH-2 client treats `0xFD` as fire-and-forget: `setSensorConfigStart` calls
-`opCompleted(pSh2, rc)` immediately after `sendCtrl`, and `setSensorConfigOp` declares no `.rx`
-handler. `opRx` (`sh2.c:350–356`) only dispatches when an operation is in progress **and** has an
-`rx` method, so the reference would ignore a `0xF1` for `0xFD` even if one arrived.
-
-The implementation, by contrast, only leaves the stage on `cmdState() == Ok`, which requires that
-ack. An absent ack is fatal; a present ack is harmless because `handleCommandResponse` only logs a
-`commandSeq` mismatch and does not reject it (`Sh2Client.cpp:211–216`). Whether this hub emits
-`0xF1` for `0xFD` is **unproven** — the “very likely never completes” statement is a hypothesis,
-not evidence. See §12.2 for the verdict split (divergence confirmed, device behaviour uncertain).
-
-> **Pass-3 status: fixed (§13.1).** Byte 1 is now `reportId`, `nextCmdSeq_` and `(void)reportId`
-> are gone, and `setFeature` completes on a successful send. A stray `0xF1` is ignored. The
-> paragraph above and the byte table describe the pre-fix code.
-
-### 4.3 Get feature (correct for the reference layout)
-
-`getFeature` sends `{0xFE, 0x05}` (`435–450`). `handleGetFeatureResponse` (`237–256`) matches on
-`featureId_`, reads `reportInterval_uS` at report offset 5 (1 id + 1 featureId + 1 flags + 2
-sensitivity = 5), stores `grantedIntervalUs_`, state `Ok`.
-
-### 4.4 Command response parsing
-
-`handleCommandResponse` (`186–235`) treats `report[2]` as command, `report[3]` as command sequence
-and `report[5]` as hub status. `report[5]` is `r[0]` in the canonical `CommandResp_t`, so the
-status offset is right.
-
-### 4.5 Timestamp reports — transposed IDs and wrong channel
-
-`Sh2Codes.h:17–18` defines `kBaseTimestampRef = 0xFA` and `kTimestampRebase = 0xFB`. The reference
-driver (`sh2.c:293–303`) defines the opposite:
-
-```c
-#define SENSORHUB_BASE_TIMESTAMP_REF (0xFB)   // uint32_t timebase
-#define SENSORHUB_TIMESTAMP_REBASE   (0xFA)   // int32_t  timebase
-```
-
-The implementation handles both only in `handleControl` (channel 2). `handleReports` decodes only
-`0x05`; other reports go to `handlers_.sensorReport`, which `Sensor::begin` sets to `nullptr`
-(`BNO085Sensor.cpp:67`), so `0xFA/0xFB` on channels 3/4 are silently skipped. **They are not
-parse-terminating:** both IDs are in `kReportLengths` (`Sh2Codes.cpp:62–63`, length 5), so the
-cursor advances correctly and the rest of the payload is still decoded. (This corrects an earlier
-draft.)
-
-Reference processing is in `sensorhubInputHdlr` (`sh2.c:542–591`), i.e. the input-report stream, not
-the control channel:
-
-```c
-referenceDelta = 0;                                  // per payload, line 549
-...
-if (reportId == SENSORHUB_BASE_TIMESTAMP_REF) {
-    referenceDelta = -rpt->timebase;                 // line 567 (assignment)
-} else if (reportId == SENSORHUB_TIMESTAMP_REBASE) {
-    referenceDelta += rpt->timebase;                 // line 572 (accumulate)
-}
-...
-event.timestamp_uS = touSTimestamp(timestamp, referenceDelta, delay);
-```
-
-and `touSTimestamp` (`sh2.c:524–540`):
-
-```c
-timestamp += hostInt + (referenceDelta + delay) * 100;
-```
-
-Consequences of the three divergences (transposed IDs, wrong scope, wrong channel):
-
-- Both fields are in 100 µs units; the base reference **replaces** and negates the delta, the
-  rebase **accumulates** onto it, and the delta lives only for the payload being parsed. The
-  implementation instead accumulates into a persistent `rebaseOffsetUs_` and increments `epoch_`
-  on the base-reference ID.
-- `computeMeasTime` substitutes a fixed `-12 000 µs` for `-timebase*100` (`Sh2Client.cpp:13`,
-  `377–383`). That is only correct if the hub's base timebase happens to be 120 ticks; otherwise
-  every `tMeasUs` carries the difference as a systematic bias. `PHASE1-NOTES.md` acknowledges the
-  approximation, but it is only safe because the base reference is being ignored.
-- If a genuine `0xFB` ever did arrive on channel 2, `handleTimestampRebase` would parse an
-  unsigned base timestamp as `int32_t`, multiply by 100 and clamp to ±`INT32_MAX` — one large
-  value would permanently saturate the offset.
-
-Net effect: on real hardware `rebaseOffsetUs_` is never updated (the input path is a no-op); the
-`0xFA`/`0xFB` cases in `handleControl` are unreachable unless the device behaves unlike the
-reference; and `epoch` never changes at a true device-time discontinuity.
-
-> **Pass-3 status: fixed (§13.2).** The IDs are swapped to `0xFB` = base reference (u32) and
-> `0xFA` = rebase (i32). Both are handled inside `handleReports` with a per-payload delta; the
-> control-channel cases and `handleTimestampRebase` were deleted. `epoch_` increments on `0xFA`.
-> Everything above this note describes the pre-fix code.
-
----
-
-## 5. Decode → timestamp → encode
-
-### 5.1 Decode
-
-`Sh2Client::handleReports` (`274–298`) walks concatenated reports via the fixed `kReportLengths`
-table (`Sh2Codes.cpp:15–73`). Unknown IDs stop parsing of that payload.
-
-`decodeRotationVector` (`sh2/Sh2Reports.cpp:8–26`) requires `length >= 14` and `report[0] == 0x05`:
-
-```
-seq = report[1]
-status = report[2]
-delayTicks = ((report[2] & 0xFC) << 6) | report[3]
-i = readI16(4), j = readI16(6), k = readI16(8), real = readI16(10)
-accuracyQ12 = readI16(12)
-```
-
-### 5.2 Fill `Quaternion` (`Sh2Client.cpp:300–375`)
-
-- `rawX..rawW = i, j, k, real`; floats = raw × `1/16384` (`kQ14Scale`).
-- `accuracy = accuracyFromStatus(status)` (status bits 1:0), `rawAccuracy = accuracyQ12`.
-- `tMeasUs = computeMeasTime(tEdgeUs, delayTicks, referenceDeltaTicks)` =
-  `clamp0(tEdge + (referenceDeltaTicks + delayTicks)×100)` (`376–382`); see §13.2 for the delta's
-  per-payload scope. The pre-fix form added a persistent `rebaseOffsetUs_`.
-- `tHostUs = tEdgeUs` (poll time, see §3.1).
-- `seq`, `epoch = (uint8_t)epoch_`, `status`, `delayTicks`, `valid = true`.
-- Duplicate suppression: identical `(seq, tMeasUs)` as the last accepted report → `duplicates++`,
-  dropped (335–343). Otherwise an 8-bit gap from the expected next sequence adds to `reportGaps`
-  (345–355).
-- Calls `handlers_.quaternion` → `Sensor::quaternionThunk` → `Sensor::onQuaternion`.
-
-### 5.3 Sensor-level handling
-
-`Sensor::onQuaternion` (`426–444`): stores `latest_`, sets `newData_` (consumed by `latest()`),
-updates `diag_.lastReportUs/lastAccuracy/reportsDecoded`, restores `Streaming` from `Degraded`,
-and if `manager_.emitBinaryFrames` calls `encoder_.writeQuaternion(index_, q)`.
-
-### 5.4 Encoded frame (34 bytes)
-
-`BinaryEncoder::writeQuaternion` (`79–98`) + `emit` (`25–65`):
-
-```
-A5 5A | ver=01 | type=01 | len=0x0018 | seq(u16 LE) | payload(24) | crc16(u16 LE)
-payload: id, flags, accuracy, seq, epoch, qFormat=14,
-         rawX i16, rawY i16, rawZ i16, rawW i16, rawAccuracy i16,
-         tMeasUs u32, tHostUs u32
-```
-
-CRC-16/CCITT-FALSE (init `0xFFFF`, poly `0x1021`), computed over bytes `[2, 8+N)` (version through
-last payload byte), appended little-endian (`emit:48–50`, `util/Crc16.cpp`). Written through
-`IOutputSink::write`; the example uses `StreamSink` over `Serial`. A short write increments
-`dropped_` and returns false; `onQuaternion` ignores the return, so no `ERROR` frame is emitted
-for output loss.
-
-Other frames: `HELLO` at begin (`writeHello`), `INIT_RESULT` at `enterStreaming`/`enterFailed`,
-`SENSOR_STATUS` periodically (`emitStatusIfDue`), `ERROR` on failure and on silence.
-`MANAGER_DIAGNOSTICS` is implemented but **never called**.
-
----
-
-## 6. State ownership as implemented
-
-| State | Owner | Notes |
-| --- | --- | --- |
-| SPI peripheral, `SPISettings` (MODE3, clock), mutex, `lockTimeoutUs_` | `SpiBusManager` | Single instance; `zeros_[256]`/`discard_[64]` scratch, `transactions_`, `lockTimeouts_`, `busErrors_` |
-| CS/INT/RST/WAKE pin numbers, `begun_`, `transfers_` | `Esp32SpiHal` (per sensor) | Pin numbers copied from `SensorConfig` |
-| RX/TX buffers, `inRemaining_/inCursor_/inChannel_/inTimestampUs_`, `nextInSeq_[8]`, `nextOutSeq_[8]`, `channelSeen_[8]`, `ShtpStats` | `ShtpTransport` (per sensor) | Sequence numbers are per sensor **and** per channel |
-| `product_`, `prodEntries_`, `prodPending_`, `cmd*`, `feature*`, `grantedIntervalUs_`, `epoch_`, `haveQuaternion_`, `lastQuat*`, `Sh2Client::Stats` | `Sh2Client` (per sensor) | No persistent timestamp offset since pass 3; `epoch_` marks rebases/reset |
-| `state_`, `stage_`, deadlines, `intPending_/intEdgeUs_`, `latest_`, `newData_`, `Diagnostics`, `encoder_` + frame `sequence_` | `Sensor` (per device) | Encoder is a per-sensor member, so the 16-bit frame sequence is per sensor |
-
-Shared read-only globals: `kZeroFill[256]` (`ShtpTransport.cpp:12`), the report-length table, CRC
-constants. All `const`, so the "no mutable file-scope state" design rule is honoured.
-
----
-
-## 7. Timeouts, retries and error paths (exhaustive as implemented)
-
-| Condition | Constant / source | Action |
-| --- | --- | --- |
-| Config invalid | `BNO085Sensor.cpp:32–49` | Return `Status::InvalidConfig`; no state machine |
-| Bus/HAL begin fails | `70–79` | `State::Failed`, lastError `InvalidConfig`, return HAL status |
-| No complete SHTP packet in boot window | `bootTimeoutMs` 300 ms, `235–237` | `enterFailed(BootTimeout)` → `Failed`, `INIT_RESULT` + `ERROR`. **No automatic retry** |
-| Product ID not valid in stage window | 100 ms from stage entry, `250–251` | `enterFailed(Sh2Timeout)` |
-| Product ID response missing | 100 ms in `Sh2Client::pollTimeouts`, `464–473` | Clears pending; counts a timeout only if no product is known |
-| Product ID request retry | every 10 ms while `!busy`, `252–255` | Re-sends `0xF9` |
-| Set-feature transport send fails | 10 ms retry, `259–266`, `275–278` | Re-sends |
-| Set-feature `HubError` branch | `271–273` | Now unreachable: pass 3 completes on send (§13.1) |
-| Set-feature ack wait | formerly 100 ms, `273–274` | Removed in pass 3; a late `0xF1` is counted unsolicited and ignored |
-| Set-feature stage window | 100 ms, `279–281` | `enterFailed(Sh2Timeout)` |
-| Get-feature send rejected | retried every update, `285–289` | `getFeatureSent_` stays false |
-| Get-feature `HubError` or `Timeout` | `290–294` | `enterFailed(Sh2BadResponse)` (both cases) |
-| Get-feature stage window | 100 ms, `295–297` | `enterFailed(Sh2Timeout)` |
-| No reports while streaming | `(interval×5)/2 + 50 ms`, `329–346` | `Degraded`, `NoReports`, one `ERROR` frame; back to `Streaming` on next report. No recovery |
-| SPI bus lock | 2 ms, `SpiBusManager.cpp:101–105` | `transfer` false, `lockTimeouts_++`; transport returns `BusError`; `Sensor` sets `SpiRead`, clears INT latch (`203–206`) |
-| Header/body transfer fails | `ShtpTransport.cpp:82–86, 207–211` | `rxErrors++`, `BusError` |
-| Oversize transfer | `146–205` | Drained in ≤256-byte chunks, ≤8 continuation fragments; error only on read failure |
-| Reserved/short/bad-channel | `110–132` | `discard(length)` capped at 1024 bytes, counted, `Malformed`; `Sensor` sets `ShtpBadFrame` and keeps servicing |
-| Length 0 | `104–108` | `Spurious`, counted, visit ends |
-| Per-visit work | 3 transfers; 2 ms budget checked **after** each transfer, `188–217` | Stops servicing; can overshoot by one transfer |
-| Wake before write | 200 µs pulse, 2 ms wait, then proceeds anyway (`Esp32SpiHal.cpp:97–116`) | `prepareWrite` never fails |
-| Reset pulse | 10 µs low + 1 ms delay, `118–128` | Blocking 1 ms |
-| `recover()` | attempts ≥ 5 → `enterFailed(BootTimeout)`; else backoff 250/500/1000/2000/4000 ms, `369–394` | `State::Recovering`; `update()` waits for `retryAtUs_`, then `startBoot()` (`148–151`) |
-| Device reset-complete | `Sh2Client.cpp:75–96` → `Sensor::onResetComplete` `446–463` | `epoch_++`; any armed cmd/feature forced to `Timeout` (the command flag is no longer ever armed); sensor returns to `StageSetFeature` (ignored during Boot/Identify) |
-| Output short write | `BinaryEncoder.cpp:52–61` | `dropped_++`, returns false silently |
-| `sendReset()` failure | `Sh2Client.cpp:452–461` | Returns false; caller in `startBoot` ignores it |
-
-**Not present:** automatic fault-triggered recovery (nothing calls `recover()` on boot/SH-2/silence
-failure), "3 consecutive invalid headers → Degraded", stuck-INT counter, per-index recovery phase
-offset, shared reset groups, and `SH2_TIMEOUT → Degraded` (it goes to `Failed`).
-
----
-
-## 8. Call-flow diagram
-
-```
-setup()
- └─ Sensor::begin                       BNO085Sensor.cpp:22
-     ├─ validate config
-     ├─ ShtpTransport::attach/setHandler
-     ├─ Sh2Client::attach/setHandlers
-     ├─ BinaryEncoder::attach
-     ├─ Esp32SpiHal::begin ──► SpiBusManager::begin   [SPI.begin, MODE3, mutex]
-     ├─ BinaryEncoder::writeHello ──► IOutputSink::write
-     └─ startBoot
-         ├─ ShtpTransport::reset / Sh2Client::reset
-         ├─ state=Booting, stage=StageBoot, deadline=now+300ms
-         └─ Esp32SpiHal::pulseReset (NRST low 10us, delay 1ms, high)
-
-loop()
- └─ Sensor::update                       BNO085Sensor.cpp:139
-     ├─ Recovering && now>=retryAtUs ──► startBoot()
-     ├─ serviceBus(now)                  165
-     │   ├─ Esp32SpiHal::intAsserted()   digitalRead (no ISR)
-     │   ├─ latch intPending_/intEdgeUs_, ++intAssertions
-     │   └─ while pending && visits<3 && elapsed<=2ms
-     │       └─ ShtpTransport::service(intEdgeUs_)              77
-     │           ├─ readRaw(peek,4) ──► Esp32SpiHal::transfer
-     │           │                       └─ SpiBusManager::transfer   [lock, CS low, xfer, CS high, unlock]
-     │           ├─ validate header/seq; oversize drain or full read
-     │           ├─ assemble fragments in rxPayload_
-     │           └─ channelThunk ──► Sensor::onChannel ──► Sh2Client::handlePayload   51
-     │               ├─ ch0: log advertisement
-     │               ├─ ch1: handleExecutable ──► Sensor::onResetComplete
-     │               ├─ ch2: handleControl
-     │               │     ├─ 0xF8 handleProdId
-     │               │     ├─ 0xF1 handleCommandResponse
-     │               │     ├─ 0xFC handleGetFeatureResponse
-     │               │     └─ 0xFB handleTimestampRebase
-     │               └─ ch3/4: handleReports                    274
-     │                     └─ 0x05 handleRotationVector         300
-     │                         ├─ sh2::decodeRotationVector      Sh2Reports.cpp:8
-     │                         ├─ computeMeasTime (tMeas)
-     │                         ├─ duplicate/gap accounting
-     │                         └─ quaternionThunk ──► Sensor::onQuaternion   426
-     │                             ├─ latest_, newData_, diag
-     │                             └─ if emitBinaryFrames
-     │                                 └─ BinaryEncoder::writeQuaternion ──► emit ──► CRC16 ──► sink->write(34 bytes)
-     ├─ Sh2Client::pollTimeouts(now)    → Timeout states
-     ├─ advanceInit(now)                → Boot→Identify→SetFeature→GetFeature→Stream
-     ├─ checkSilence(now)               → Degraded + ERROR
-     └─ emitStatusIfDue(now)            → SENSOR_STATUS frame
-```
-
----
-
-## 9. Differences between implementation and documented architecture
-
-### 9.1 Already acknowledged in `docs/PHASE1-NOTES.md`
-
-- `Sensor(IHal&)` instead of the sensor creating its own HAL.
-- Own minimal SH-2 instead of vendoring CEVA's.
-- 16-bit frame sequence at offset 6 instead of 32-bit.
-- `tMeas` uses a fixed −12 000 µs instead of applying the `0xFA` base-timestamp reference.
-- Oversize transfers drained, not assembled.
-- `Sensor::get()` returns false.
-
-### 9.2 Not acknowledged, materially different from `docs/ARCHITECTURE.md`
-
-1. **No ISR.** §6.4 specifies `attachInterrupt(..., FALLING)`, an atomic pending mask and a level
-   re-check. The code polls `digitalRead` every `update()`. `tHostUs` is therefore poll-observation
-   time, not the H_INTN assertion time.
-2. **No `Manager`, no cross-sensor round-robin.** §3/§5.1 specify a sensor table, cursor, fairness
-   and starvation handling. There is none; `serviceBudgetUs`/`maxTransfersPerVisit` apply inside
-   one sensor only.
-3. **No aggregation layer.** `aggregate/ReportQueue.h`, `ReportAggregator`, `next(Record&)` and the
-   record queue do not exist. `Record` is declared but never constructed. Emission is synchronous
-   from the report callback; the `BinaryEncoder` and its sequence are per sensor, not the single
-   output-writer/drain described in §4.3/§8. `writeManagerDiagnostics` exists but is never called.
-4. **No automatic recovery orchestration.** §7.4's `Streaming → Recovering → Reconfiguring →
-   Streaming` with attempt limits, backoff and `(index × 37 ms)` phase offset is not implemented.
-   Faults call `enterFailed()` and `update()` returns early forever; the application must call
-   `recover()` (the example binds this to `r`).
-5. **`resetGroup` is dead.** Declared in `SensorConfig` and initialised to 0 in both constructors;
-   never read. §7.1/§7.5 shared-reset behaviour does not exist.
-6. **Validation is much thinner than §4.1 / API §2.3.** No sensor-count check, no distinct-CS
-   check, no `csPin != intPin/resetPin` check, no duplicate-pin status. `Status::DuplicatePin`,
-   `NoSensors`, `OutputUnavailable` are never returned. `allowGrvFallback` is unused.
-7. **Optional reports are accepted but never used.** `enable()` stores extras and `reportsValid()`
-   validates them, but `advanceInit` sends only the primary report, `handlers_.sensorReport` is
-   `nullptr`, and `get()` returns false. Extras are silently ignored rather than rejected.
-8. **Failure detection differs.** §7.3's "3 consecutive invalid headers", "malformed counter
-   increase", product-ID mismatch gate and `Degraded` on SH-2 timeout are absent. SH-2 failures go
-   straight to `Failed`. `ErrorCode::ProductIdMismatch`, `BusTimeout`, `SpiWrite`,
-   `ShtpBadChannel`, `QueueOverflow`, `OutputOverflow` are never produced.
-9. **Fragments are handled better than documented.** Ordinary transfers ≤256 B **are** reassembled
-   (192-byte payload buffer, `223–267`); only oversized transfers are drained.
-10. **Bus-lock scope.** The lock is taken per SPI transaction (`SpiBusManager::transfer`); there is
-    no separate output-drain phase, and the output write happens inside `update()` between SPI
-    transfers. The bus is not held across the write, but the §4.3 "drain outside the bus lock"
-    structure is not present.
-11. **`update()` cannot guarantee `serviceBudgetUs`.** The budget is checked *after* each transfer,
-    and a 256-byte read at 1 MHz is already ~2 ms. `maxServiceUs` records the overrun rather than
-    preventing it.
-12. **Boot completion criterion.** §7.2 says ready when H_INTN asserts; the code waits for any
-    complete SHTP packet (`225`), and the 552-byte advertisement does not count as one because the
-    oversize path returns before `++stats_.packets`.
-13. **Diagnostics gaps.** `diag_.product`, `csTransactions`, `spiTransfers`, `busTimeouts`,
-    `transferBytes` are never written (grep confirms). The example's `printDiagnostics()` prints
-    `d.product.partNumber`, which is therefore always `0`. `SpiBusManager::lockTimeouts_` is never
-    surfaced.
-14. **Status frame semantics.** `SENSOR_STATUS` is emitted only periodically, not "periodically and
-    on state change"; payload offset 8 is `reportsDecoded`, while `API.md` documents `rxPackets`.
-
-### 9.3 Protocol/code defects found in the implementation (not documented anywhere)
-
-15. **Set-feature payload byte 1 is a sequence counter, not the feature report ID**
-    (**fixed in pass 3, §13.1**; text retained as the pre-fix record)
-    (`Sh2Client.cpp:405–413`, `(void)reportId` at 431). Canonical SH-2 is
-    `0xFD, featureReportId, flags, …`; this sends `0xFD, seq, flags, …`, so the hub is asked to
-    configure report `0x00/0x01/…` instead of `0x05`. The host test enshrines the same bytes
-    (`test_main.cpp:445–464`).
-16. **Set-feature waits for an `0xF1` ack** (**fixed in pass 3, §13.1**: completion is now send
-    success and a stray ack is ignored)
-    that the reference SH-2 client does not expect (it
-    completes immediately after `sendCtrl` and declares no `rx` handler). The divergence is
-    certain; whether this hub acks `0xFD` is unproven. If it does not, `StageSetFeature` times out.
-    See §12.2.
-17. **`0xFA`/`0xFB` are transposed and handled on the wrong channel**
-    (**fixed in pass 3, §13.2**: IDs corrected and both handled per payload in `handleReports`).
-    `Sh2Codes.h:17–18` labels
-    `0xFA` base timestamp ref and `0xFB` timestamp rebase; the reference defines the opposite
-    (`0xFB` = base timestamp reference, u32; `0xFA` = timestamp rebase, i32). The reference also
-    processes them inside the input-report stream; this code parses them only on channel 2 and
-    skips them on channels 3/4. The input-path skip is silent but does not abort the payload,
-    because both IDs have lengths in `kReportLengths`. See §4.5 and §12.3.
-18. **`recover()` does not reset the attempt counter**, contradicting `ARCHITECTURE.md:410`
-    (“it resets the attempt counter”). Attempts are reset only in `begin()` and `enterStreaming()`,
-    so five manual retries leave the sensor permanently `Failed` until `begin()` is called again.
-    See §12.4.
-19. **`dropped_` is not a loss counter, and loss is never surfaced.** `emit()` increments it when
-    `sink_ == nullptr` (`BinaryEncoder.cpp:27–30`), which is the normal state when
-    `emitBinaryFrames == false` — so `HELLO`, `INIT_RESULT` and `ERROR` writes inflate it even
-    though nothing was meant to be written. Real short writes are counted too, but `framesDropped()`
-    is never read, every caller ignores the `bool`, and `ErrorCode::OutputOverflow` is never
-    produced. See §12.5.
-
-### 9.4 Files promised by the architecture but absent
-
-`src/aggregate/`, `src/util/RingBuffer.h`, `src/util/Time.h`, `src/diag/Diagnostics.h`,
-`src/diag/RecoveryPolicy.h` (the struct lives in `BNO085Types.h`),
-`src/output/JsonDebugEncoder.*`, `src/sh2/third_party/ceva/` (the audit's "vendored stateless
-decoder"), `extras/host/bno085_stream.py`, `examples/02`/`03`, `BNO085Manager.*`, `LICENSE`,
-`NOTICE`. Root contains only `library.properties`, `keywords.txt`, `README.md` plus `src/`,
-`docs/`, `examples/`, `test/`.
-
-### 9.5 Minor behavioural notes
-
-- `disable()` only sets `State::Disabled`; it sends nothing to the device, which keeps streaming and
-  asserting INT.
-- `configure()` sends a new set-feature without waiting for or verifying the granted interval. Since
-  pass 3 it targets report `0x05` correctly, but the granted interval is still only observed via the
-  separate get-feature exchange in the init sequence.
-- `begin()` writes `HELLO` with `sensorCount = 1` hardcoded.
-- `Sh2Client::reset()` clears pending state but keeps `epoch_`; timestamp offsets are per payload
-  since pass 3, so a payload after reset uses the fallback delta until the next `0xFB`.
-- `Sensor::end()` only drives CS high and clears `started_`; it does not reset SHTP/SH-2 state or
-  the bus manager.
-- `SpiBusManager::transfer` has no RAII CS guard, but it has no early return between CS-low and
-  CS-high, so the "CS deasserted on every path" invariant holds in practice.
-- `ShtpTransport::discard()` caps at 1024 bytes, so a genuinely long malformed transfer can leave
-  bytes pending and desynchronise the stream.
-
----
-
-## 10. Verification status (from the repo's own evidence)
-
-- Host tests: **35 cases / 194 checks**, MSVC 2022, `test\native\build_msvc.bat`; GCC variant
-  `sh test/native/build_gcc.sh` (not run here — no `sh`/`g++` in this environment). They cover CRC,
-  framing, SHTP header/oversize/fragment paths, Rotation Vector decode, set-feature bytes and
-  completion, timestamp reference/rebase, timeouts and the init state machine. Before pass 3 the
-  suite asserted the same wrong set-feature byte 1 the code produced; that test was re-baselined.
-- ESP32-S3 build: `esp32:esp32:esp32s3`, core 3.3.12 — **324 210 B** flash (24%), 23 880 B static
-  RAM (7%), 0 warnings, 0 errors with `--warnings all` (`build\esp32s3_final.log`).
-- Hardware-confirmed (README/PHASE1-NOTES): bus/CS, reset pulse, boot in ~93.7 ms, 552-byte
-  channel-0 advertisement drained in 4 bus transactions, stream returns to idle.
-- **Not** hardware-confirmed: product-ID retrieval, set/get feature, quaternion streaming,
-  timestamp reconstruction, soak, INT-loss behaviour, cold boots.
-- Pass 2 (2026-11-17) added **no** new hardware evidence. The set-feature ack question, the real
-  magnitude of base timestamps, and actual INT-to-poll latency remain unmeasured; see §12.9.
-- Pass 3 implemented P1–P3 from §12.7 and re-ran the host suite and ESP32-S3 compile (above). It
-  added **no** hardware evidence either; the same three questions remain open.
-- **Pass 4 (2026-11-18)** re-ran both checks after the §14 changes: **39 cases / 185 checks, 0
-  failures** and **324 174 B** flash (24 %), 23 880 B RAM (7 %), 0 warnings/errors. MSVC
-  `/analyze` was clean; MSVC AddressSanitizer could not be linked because the runtime library is
-  not installed. Still no hardware evidence.
-
----
-
-## 11. Suggested next steps for the next agent (no changes made yet)
-
-> Do not assume the "intended" design from `docs/`; the code above is what runs.
-
-1. **Fix set-feature first** (defect 15): byte 1 must be `reportId`, not `nextCmdSeq_`; remove the
-   `(void)reportId`. Update `test/native/test_main.cpp:445–464` to assert `frame[5] == 0x05` and
-   re-baseline the expected bytes. Decide, with hardware evidence, whether the `0xF1` ack must be
-   awaited (defect 16); the reference SH-2 client does not.
-2. **Correct `0xFA`/`0xFB`** (defect 17) and parse them in `handleReports` on channels 3/4, as the
-   reference does, or explicitly document that timestamp rebase is unsupported.
-3. **Populate `Diagnostics::product`** (and, if wanted, `csTransactions`/`busTimeouts`) from
-   `Sh2Client::productInfo()`/`SpiBusManager`, or change the example so it does not print a
-   permanently-zero field.
-4. **Decide the INT story:** implement the documented ISR + pending mask (to get honest
-   `tHostUs`), or amend `ARCHITECTURE.md` §6.4 to document polling. The current docs and code
-   contradict each other.
-5. **Decide the recovery story:** either add fault-triggered `recover()` with attempt limits and
-   backoff, or document that recovery is application-driven in Phase 1.
-6. **Decide the multi-sensor story:** `Manager`, aggregation and per-sensor encoder sequencing are
-   Phase 2; today there is no way to use the library with more than one sensor without writing the
-   scheduler yourself.
-7. Re-run host tests and the ESP32-S3 compile after any change; do not claim hardware validation
-   for stages 3+ until it is actually measured.
-
-> The sequencing in §12.8 supersedes this list. The list is retained because it records the
-> pass-1 plan; §12 re-derived the findings and re-ordered the repairs.
-
----
-
-## 12. Independent verification of the five priority findings (pass 2)
-
-**Method.** Each cited function was re-read from the source rather than trusted from pass 1, and
-compared with the Hillcrest/CEVA reference `sh2.c` (Adafruit mirror, downloaded to
-`%TEMP%\sh2_ref.c`; line numbers below are from that snapshot). No source file was modified.
-
-### 12.0 Verdict summary
-
-| # | Finding | Verdict |
-| --- | --- | --- |
-| 1a | Set-feature byte 1 carries a command counter instead of the feature report ID | **Confirmed defect** |
-| 1b | Set-feature waits for a `0xF1` acknowledgement | **Divergence confirmed; device behaviour uncertain** |
-| 2a | `0xFA`/`0xFB` are transposed | **Confirmed defect** |
-| 2b | Signedness/units of the two reports | **Confirmed for `0xFA`; `0xFB` is mishandled** |
-| 2c | Both parsed only on the control channel | **Confirmed defect** |
-| 3 | `tHostUs` is poll time, docs claim INT-assertion time | **Confirmed mismatch (code vs documentation)** |
-| 4 | Nothing calls `recover()`; `recover()` does not reset attempts | **Confirmed defect** |
-| 5 | Output write failures are never surfaced | **Confirmed defect** |
-
-### 12.1 Set-feature payload construction — confirmed
-
-**Implementation.** `Sh2Client::setFeature` (`src/sh2/Sh2Client.cpp:399–433`), payload built at
-405–413. Byte-by-byte comparison with `SetFeatureReport_t` is in §4.2; summary: byte 0 `0xFD`,
-byte 1 `nextCmdSeq_++`, byte 2 flags, bytes 3–4 zero, bytes 5–8 interval LE, bytes 9–16 zero.
-Total 17 payload bytes / 21-byte SHTP frame, which is correct.
-
-**Reference.** `sh2.c`, `SENSORHUB_SET_FEATURE_CMD`:
-
-```c
-uint8_t reportId;          // 0xFD
-uint8_t featureReportId;   // sensor id
-uint8_t flags;
-uint16_t changeSensitivity;
-uint32_t reportInterval_uS;
-uint32_t batchInterval_uS;
-uint32_t sensorSpecific;
-```
-
-`setSensorConfigStart` memsets, then fills `req.featureReportId = ...sensorId`, `req.flags` from
-the config, `req.changeSensitivity`, `req.reportInterval_uS`, `req.batchInterval_uS`,
-`req.sensorSpecific`, and calls `sendCtrl` with `sizeof(req)`. `sendCtrl` (`sh2.c:668–671`) adds
-only the SHTP header.
-
-**Only byte 1 is wrong.** The argument is explicitly discarded at line 431 (`(void)reportId;`),
-and the log line at 427 prints the correct ID while the wire carries something else.
-`Sensor::configure` passes `Report::RotationVector` = `0x05` (`BNO085Sensor.cpp:401–402`), so the
-correct value is available. The host test asserts the wrong byte:
-`test/native/test_main.cpp:457` checks `frame[5] == 0x00`.
-
-**Functional consequence.** The hub is asked to configure feature `0x00`, `0x01`, … instead of
-`0x05`. At best a hub error; at worst nothing is configured and no Rotation Vector ever streams.
-This is the most plausible reason stage 3 is the first unverified stage in `PHASE1-NOTES.md`.
-
-**Regression test.** In `testSh2SetFeatureBytes` (`test/native/test_main.cpp:445–464`):
-
-```cpp
-CHECK(frame.size() == 21);
-CHECK(frame[4] == 0xFD);
-CHECK(frame[5] == 0x05);   // featureReportId, not a counter
-CHECK(frame[6] == 0x00);   // flags
-CHECK(frame[9] == 0x60 && frame[10] == 0xEA);  // 60000 LE
-CHECK(frame[17] == 0x00 && frame[18] == 0x00 &&
-      frame[19] == 0x00 && frame[20] == 0x00); // sensorSpecific
-```
-
-Call `setFeature` twice and assert byte 1 stays `0x05` (no counter drift).
-
-### 12.2 Set-feature acknowledgement — divergence confirmed, device behaviour uncertain
-
-**Implementation.** `setFeature` sets `cmdPending_ = true`, `cmdId_ = 0xFD`,
-`cmdDeadlineUs_ = now + 100 ms` (`Sh2Client.cpp:420–424`). `StageSetFeature`
-(`BNO085Sensor.cpp:258–281`) only leaves the stage when `cmdState() == Ok`, which requires an
-`0xF1` whose `command == 0xFD` (`handleCommandResponse`, `Sh2Client.cpp:186–234`). Otherwise the
-100 ms stage window fails the sensor.
-
-**Reference.** `setSensorConfigStart` ends with:
-
-```c
-rc = sendCtrl(pSh2, (uint8_t *)&req, sizeof(req));
-opCompleted(pSh2, rc);          // completes immediately on send result
-return rc;
-```
-
-and `const sh2_Op_t setSensorConfigOp = { .start = setSensorConfigStart };` declares no `.rx`.
-`opRx` (`sh2.c:350–356`) only dispatches when an operation is in progress **and** has an `rx`
-method — so the reference would ignore a `0xF1` for `0xFD` even if one arrived. The subsequent
-`0xFE`/`0xFC` exchange is the real validation.
-
-**Functional consequence and confidence.** The code↔reference divergence is certain. Whether this
-hub firmware emits `0xF1` for `0xFD` is **not proven**; there is no capture in the repo. An absent
-ack is fatal; a present ack is harmless because `handleCommandResponse` only logs a `commandSeq`
-mismatch (211–216) and does not reject it. Pass 1's “very likely never to complete” is therefore a
-hypothesis, not evidence.
-
-**Regression test.** A state-machine test that feeds **no** `0xF1`: after `setFeature` returns
-true and the stage deadline passes, feed an `0xFC` get-feature response and assert the sensor
-reaches `Streaming`. Today that test fails (the stage goes `Failed` first); it is the proof needed
-once the ack policy changes.
-
-### 12.3 Timestamp reference/rebase reports — confirmed
-
-**IDs and signedness.** `Sh2Codes.h:17–18` swaps `SENSORHUB_BASE_TIMESTAMP_REF (0xFB, u32)` and
-`SENSORHUB_TIMESTAMP_REBASE (0xFA, i32)` from `sh2.c:293–303`. Because
-`handleTimestampRebase` (`Sh2Client.cpp:258–272`) reads `int32_t`, the report it treats as a
-rebase is the **unsigned** base reference.
-
-**Scope and sign.** Reference `sensorhubInputHdlr` (`sh2.c:542–591`) resets
-`referenceDelta = 0` per payload (549), assigns `referenceDelta = -rpt->timebase` for a base
-reference (567), accumulates `referenceDelta += rpt->timebase` for a rebase (572), and computes
-`timestamp += hostInt + (referenceDelta + delay) * 100` (`touSTimestamp`, 524–540). Both fields
-are 100 µs units.
-
-**Channel.** Reference processes both in the input handler (registered on `inputNormal`/`inputWake`,
-`sh2.c:1736–1737`). Implementation handles `kTimestampRebase` (i.e. `0xFB` today) only in
-`handleControl` (`Sh2Client.cpp:114–133`) and only logs `kBaseTimestampRef` (`0xFA`).
-`handleReports` (`274–298`) decodes only `0x05`; everything else goes to
-`handlers_.sensorReport`, which is `nullptr` (`BNO085Sensor.cpp:67`).
-
-**Correction to pass 1:** `0xFA`/`0xFB` on channels 3/4 do **not** abort parsing. Both have
-length 5 in `kReportLengths` (`Sh2Codes.cpp:62–63`), so the cursor advances and the rest of the
-payload still decodes. They are silently skipped.
-
-**Functional consequence.** With real hardware `rebaseOffsetUs_` is never updated at all; the
-control-channel cases are unreachable in normal operation. `computeMeasTime`
-(`Sh2Client.cpp:377–383`) substitutes `-12 000 µs` (`kTimebaseReferenceUs`, line 13) for
-`-timebase*100`, which is only correct when the hub's base timebase is 120 ticks — otherwise every
-`tMeasUs` has a systematic bias. `epoch_` increments on the base-reference ID instead of the real
-rebase. If a genuine `0xFB` ever arrived on channel 2, an unsigned base timestamp parsed as
-`int32_t` × 100 would saturate the offset at ±`INT32_MAX`.
-
-**Regression test.** Feed a channel-3 payload `{0xFB, timebase u32 LE, 0x05, RV(14)}` at a fixed
-`tEdge`; assert `tMeasUs == tEdge - timebase*100 + delay*100`. Then
-`{0xFB, tb, 0xFA, +N i32, 0x05, RV, 0x05, RV}` and assert the delta `-tb + N` applies to the
-reports in **that payload only**, with the next payload falling back to the documented default.
-Also assert `0xFB` on channel 2 no longer mutates the offset after the fix.
-
-### 12.4 INT timestamp semantics — confirmed mismatch
-
-**Implementation.** `Esp32SpiHal::intAsserted()` (`Esp32SpiHal.cpp:91–95`) is
-`digitalRead(intPin) == LOW`; there is no `attachInterrupt` in `src/`. `Sensor::serviceBus`
-(`BNO085Sensor.cpp:165–180`) latches `intEdgeUs_ = nowUs` where `nowUs` is `startUs` from
-`Sensor::update` (139–146). `shtp_.service(intEdgeUs_)` (189) stamps every packet drained in that
-visit with the same first-observation time. `Sh2Client` copies it through unchanged:
-`q.tHostUs = tUs` (`Sh2Client.cpp:325`) and `q.tMeasUs = computeMeasTime(tUs, …)` (324), so
-`tMeasUs` inherits the lateness.
-
-**Documentation.** `README.md:121`; `docs/API.md:179` and `:378`; `docs/ARCHITECTURE.md:169`,
-`:306–312` (explicit `attachInterrupt(..., FALLING)` and `edgeUs[i] = micros()`), and `:436` — all
-state that `tHostUs` is the value at H_INTN assertion.
-
-**Functional consequence.** Both exported timestamps are late by the time between the assertion
-and the next `update()`, worst case one application loop period plus any blocking work earlier in
-that iteration. `diag_.lastIntUs` and `diag_.lastReportUs`, and therefore the silence check
-(`BNO085Sensor.cpp:334`), use the same value. There is no data loss from polling — H_INTN is level
-asserted until CS is observed — so this is a fidelity problem, not a missed-interrupt problem.
-
-**Regression test.** With `MockHal`, set `intState = true` and advance `clockUs` by 7 000 µs
-before `update()`; assert `q.tHostUs` equals the poll time, 7 000 µs later than the simulated
-assertion. After an ISR implementation, add an edge-injection hook and assert `q.tHostUs` equals
-the recorded edge. A docs-only resolution is “fixed” by amending the three documents.
-
-### 12.5 Recovery call sites — confirmed
-
-**Nothing calls `recover()`.** Exhaustive `enterFailed` sites in `BNO085Sensor.cpp`: 236 (boot
-timeout), 251 (identify timeout), 272/274 (set-feature hub error/timeout), 280 (set-feature
-window), 294/296 (get-feature hub error/timeout), plus 374 inside `recover()` itself. All set
-`State::Failed` and emit `INIT_RESULT` + `ERROR` (505–516). The only call to `recover()` in the
-repository is `examples/01_SingleSensor/01_SingleSensor.ino:97` (the `r` key).
-
-**`update()` makes `Failed` terminal.** Lines 139–144 return immediately for `Failed`, so a failed
-sensor stays failed until the application intervenes.
-
-**`recover()` does not reset attempts.** `recover()` (369–394) increments
-`recoveryAttempts_` and never resets it, contradicting `ARCHITECTURE.md:410` (“it resets the
-attempt counter”). Attempts are reset only in `begin()` (82–83) and `enterStreaming()` (314–315),
-so a device that never reaches streaming exhausts the budget after five manual calls and the sixth
-goes to `enterFailed(BootTimeout)` permanently.
-
-**Silence does not recover either.** `checkSilence` (329–346) only sets `Degraded` and emits one
-`ERROR`; `Degraded` self-clears on the next report (434–439), so a device that stops forever stays
-`Degraded` forever.
-
-**Functional consequence.** Any transient boot or SH-2 timeout is a permanent outage in an
-unattended system. The documented `Streaming → Recovering → Reconfiguring → Streaming` loop with
-backoff and phase offset (`ARCHITECTURE.md:400–414`) does not exist.
-
-**Regression test.** Empty `MockHal` queue, advance past `bootTimeoutMs`, assert `State::Failed`;
-then queue a valid boot packet and call `update()` 1 000 times, asserting the state stays `Failed`
-(locks in today's contract; invert it when auto-recovery is added). Second test: call `recover()`
-six times, assert the sixth returns `SensorFailed` and `State::Failed`; after the fix assert the
-counter resets and the sensor retries.
-
-### 12.6 Output loss — confirmed
-
-**Trace.** `BinaryEncoder::emit` (`BinaryEncoder.cpp:25–65`):
-
-```cpp
-if (sink_ == nullptr) { ++dropped_; return false; }             // 27–30
-if (len > kMaxPayloadBytes) { ++dropped_; ... return false; }    // 31–36
-...
-protocol::putU16(frame_ + kSequenceOffset, sequence_++);         // 43, before the write
-...
-const size_t written = sink_->write(frame_, total);
-if (written != total) { ++dropped_; log(...); return false; }     // 53–61
-```
-
-Every caller ignores the return: `BNO085Sensor.cpp:85` (`writeHello`), `319` (`writeInitResult`),
-`339` (`writeError`), `353` (`writeStatus`), `442` (`writeQuaternion`), `508`
-(`writeInitResult`), `511` (`writeError`). `framesDropped()` (`BinaryEncoder.h:25`) is never
-referenced. `ErrorCode::OutputOverflow` (`BNO085Types.h:93`) is produced nowhere; it appears only
-in `errorName` (`BNO085Types.cpp:72`).
-
-**Two subtleties.**
-
-- `sequence_++` happens **before** the write, so a dropped frame still consumes a sequence number.
-  A host that survives sees a gap, but the wire format does not otherwise announce the loss and no
-  `ERROR` frame is emitted.
-- When `emitBinaryFrames` is false, `begin()` attaches `nullptr` (`BNO085Sensor.cpp:56`), so
-  `writeHello` and every `enterFailed` `INIT_RESULT`/`ERROR` increment `dropped_` even though
-  nothing was meant to be written. As it stands `dropped_` means “write not performed”, not
-  “frame lost”, so exposing it without this fix would be misleading.
-
-**Functional consequence.** Silent data loss; the consumer sees a sequence gap indistinguishable
-from a sensor dropout, with no counter, status bit or error frame to disambiguate.
-
-**Regression test.** A sink that accepts a configurable number of bytes and then short-writes.
-Assert `writeQuaternion` returns false, `framesDropped() == 1`, `sequence_` advanced by 1, and no
-`ERROR` frame (today's behaviour). After the fix, assert an `ERROR(OutputOverflow)` or a surfaced
-`Sensor::framesDropped()` while the sink is healthy again. Add a companion test that
-`emitBinaryFrames == false` leaves the counter at 0.
-
-### 12.7 Prioritized confirmed defects
-
-1. **P1 — Set-feature byte 1 is a command counter, not `0x05`** (`Sh2Client.cpp:405–413`,
-   `(void)reportId` at 431). Blocks the only configuration path; the host test enshrines the bug
-   (`test_main.cpp:457` asserts `frame[5] == 0x00`).
-2. **P2 — Set-feature completion depends on an `0xF1` ack** (`BNO085Sensor.cpp:267–281`).
-   Reference treats `0xFD` as fire-and-forget. Even with P1 fixed, this can hang the state
-   machine.
-3. **P3 — `0xFA`/`0xFB` transposed, mishandled and on the wrong channel** (`Sh2Codes.h:17–18`;
-   `Sh2Client.cpp:114–133`, `258–272`, `274–298`; `BNO085Sensor.cpp:67`). Device-time
-   reconstruction is wrong and `epoch` never marks a discontinuity.
-4. **P4 — `tHostUs`/`tMeasUs` are poll-observation times, documented as INT-assertion times**
-   (`BNO085Sensor.cpp:165–171`, `Sh2Client.cpp:324–325`; docs `README:121`, `API:179,378`,
-   `ARCHITECTURE:169,306–312,436`). Either the code or six documentation statements must change.
-5. **P5 — No fault-triggered recovery; `recover()` does not reset its attempt budget**
-   (`BNO085Sensor.cpp:139–144`, `369–394`; `ARCHITECTURE.md:410`). Any transient fault is terminal;
-   a device that never re-streams is permanently `Failed` after five manual retries (a successful
-   recovery resets the counter in `enterStreaming()`).
-6. **P6 — Output loss is silent and the drop counter is not even a loss counter**
-   (`BinaryEncoder.cpp:27–61`; `BinaryEncoder.h:25`; `BNO085Types.h:93`).
-
-### 12.8 Proposed minimal repair sequence
-
-1. **Byte 1 (P1).** Replace `payload[1] = sequence;` with `payload[1] = reportId;`, delete
-   `(void)reportId;`, and stop deriving `cmdSeq_` from the payload field (keep the transport
-   sequence as-is). Re-baseline `testSh2SetFeatureBytes`. One-line change, no dependency on
-   anything else.
-2. **Ack policy (P2).** Decide with evidence: either capture the control channel for 100 ms after
-   a real `0xFD`, or match the reference and complete `StageSetFeature` as soon as
-   `transport_->send` succeeds, treating `0xFE`/`0xFC` as validation. Keep accepting a stray
-   `0xF1` if it arrives. Add the “init completes without `0xF1`” test.
-3. **Timestamps (P3).** Swap the two constants; handle both IDs in `handleReports` with a
-   per-payload local delta; store the base reference and use `-timebase*100` in `computeMeasTime`,
-   retaining the `-12 000` fallback only for payloads before any base reference; increment `epoch_`
-   on `0xFA`, not `0xFB`. Add the golden channel-3 tests. After steps 1–2, because it cannot be
-   validated without streaming.
-4. **INT (P4).** Choose: implement the documented ISR (falling edge → volatile pending flag +
-   `edgeUs`, level re-check retained) or amend `README`/`API`/`ARCHITECTURE` to say
-   “poll-observation time”. If implementing, extend `MockHal` with an edge hook and assert against
-   it. Independent of 1–3.
-5. **Recovery (P5).** Wire the `enterFailed` paths (or `update()` while `Failed`) into `recover()`
-   with the existing `RecoveryPolicy` limits and backoff, and reset `recoveryAttempts_` in
-   `recover()` per the doc — or amend `ARCHITECTURE.md:400–414` to state that recovery is
-   application-driven in Phase 1. Invert the “stays Failed” test into “auto-retries after backoff”.
-6. **Output loss (P6).** Attach `NullOutputSink` instead of `nullptr` so `dropped_` only counts
-   real short writes; propagate `write*` returns into `Sensor`; expose `framesDropped()`; emit one
-   rate-limited `ERROR(OutputOverflow)` per loss episode that suppresses itself if the sink is
-   still failing. Add the short-write test last — it needs the surfaced counter from this step.
-
-Rationale: 1–2 unblock bring-up; 3–4 fix data correctness; 5 addresses availability; 6 addresses
-observability. Each step is independently testable.
-
-### 12.9 Limits of this verification
-
-- No hardware was exercised. Three points remain unproven: (a) whether this hub acks `0xFD`,
-  (b) the magnitude of real base timestamps, (c) actual INT-to-poll latency. They are the only
-  findings marked uncertain.
-- Pass-1 statements corrected in pass 2: the input-channel `0xFA`/`0xFB` skip does **not** abort
-  payload parsing (both have lengths), and “set-feature is very likely never to complete” is a
-  hypothesis, not a measurement.
-- Everything else in §0–§11 held under independent re-reading.
-
----
-
-### Appendix A — quick symbol index
-
-| Concern | File | Symbols |
-| --- | --- | --- |
-| State machine | `src/BNO085Sensor.cpp` | `begin`, `update`, `startBoot`, `serviceBus`, `advanceInit`, `enterStreaming`, `checkSilence`, `recover`, `onQuaternion`, `onResetComplete`, `mirrorStats` |
-| SHTP | `src/shtp/ShtpTransport.cpp` | `service`, `send`, `readRaw`, `discard` |
-| SH-2 | `src/sh2/Sh2Client.cpp` | `handlePayload`, `handleControl`, `handleReports`, `handleRotationVector`, `requestProductIds`, `setFeature`, `getFeature`, `sendReset`, `pollTimeouts` |
-| RV decode | `src/sh2/Sh2Reports.cpp` | `decodeRotationVector` |
-| Output | `src/output/BinaryEncoder.cpp` | `emit`, `writeHello`, `writeQuaternion`, `writeInitResult`, `writeStatus`, `writeError`, `writeManagerDiagnostics` |
-| Bus | `src/hal/SpiBusManager.cpp` | `begin`, `transfer`, `lock`, `unlock` |
-| HAL | `src/hal/Esp32SpiHal.cpp` | `begin`, `transfer`, `intAsserted`, `prepareWrite`, `pulseReset` |
-| Frame protocol | `src/output/OutputProtocol.h` | sync `0xA5 0x5A`, version 1, 8-byte header, 64-byte max payload, CRC-16/CCITT-FALSE |
-
-### Appendix B — key constants
-
-| Constant | Value | Where |
-| --- | --- | --- |
-| `kDefaultIntervalUs` | 10 000 (100 Hz) | `BNO085Config.h:44` |
-| `kMinIntervalUs` | 1 000 | `BNO085Config.h:45` |
-| `kSpiMaxHz` | 3 000 000 | `BNO085Config.h:46` |
-| RX transfer / payload / TX transfer | 256 / 192 / 64 bytes | `BNO085Config.h:12–22` |
-| Boot timeout | 300 ms | `RecoveryPolicy::bootTimeoutMs` |
-| Command timeout | 100 ms | `RecoveryPolicy::commandTimeoutMs` |
-| Recovery backoff | 250/500/1000/2000/4000 ms | `RecoveryPolicy::backoffMs` |
-| Max recovery attempts | 5 | `RecoveryPolicy::maxAttempts` |
-| Bus lock timeout | 2 000 µs | `ManagerConfig::busTimeoutUs` |
-| Service budget / max transfers | 2 000 µs / 3 | `ManagerConfig` |
-| Silence limit | `(interval × 5)/2 + 50 ms` | `BNO085Sensor.cpp:332–333` |
-| `tMeas` | `tEdge + (referenceDelta + delayTicks) × 100` | `Sh2Client.cpp:13–14, 376–382` |
-| `kDefaultReferenceDeltaTicks` | 0 ticks; per-payload starting delta before any `0xFB` | `Sh2Client.cpp:14` |
-| `kTimestampTickUs` | 100 µs per tick | `Sh2Client.cpp:15` |
-| `tMeas` width | low 32 bits of the 64-bit reference formula; wraps with `micros()` | `Sh2Client.cpp:377–384` |
-| Reference base timestamp | `0xFB`, u32, `referenceDelta = -timebase` | `sh2.c:293–298, 563–567` |
-| Reference timestamp rebase | `0xFA`, i32, `referenceDelta += timebase` | `sh2.c:299–303, 569–572` |
-
-### Appendix C — verification checklists
-
-| Step | Code | Reference behaviour | Check |
-| --- | --- | --- | --- |
-| Set-feature payload | `Sh2Client.cpp:399–429` | 17 bytes, byte 1 = feature ID | **done (pass 3):** byte 1 = `reportId` |
-| Set-feature completion | `BNO085Sensor.cpp:258–281` | completes on `sendCtrl`, no `.rx` | **done (pass 3):** completes on send; stray ack ignored |
-| Base timestamp | `Sh2Client.cpp:266–275` inside `handleReports` | input payload, `0xFB`, u32, negated | **done (pass 3); fallback/clamp made reference-exact in pass 4 (§14.2)** |
-| Timestamp rebase | `Sh2Client.cpp:276–286` inside `handleReports` | input payload, `0xFA`, i32, accumulated | **done (pass 3); reference-exact fallback in pass 4 (§14.2)** |
-| INT capture | `BNO085Sensor.cpp:165–171` | ISR edge per docs | `tHostUs` is poll time today (**open**) |
-| Recovery entry | `BNO085Sensor.cpp:369` (manual only) | fault → Recovering | `Failed` is terminal today (**open**) |
-| Output loss | `BinaryEncoder.cpp:53–61` | caller decides | returns are ignored today (**open**) |
-
----
-
-## 13. Implementation pass (pass 3) — P1–P3 applied
-
-### 13.0 Answers to the eight verification questions
-
-> This is a summary of work performed earlier in the same session (code/test commit `25deebf`,
-> document commit `5b0034f`). It is **not** a new verification pass: no source, test or build was
-> re-run to produce this table. §13.1–§13.6 hold the evidence.
-
-| # | Question | Answer |
-| --- | --- | --- |
-| 1 | Was the set-feature payload verified against the authoritative SH-2 implementation? | **Yes.** Compared with the CEVA/Hillcrest `sh2.c` definitions `SetFeatureReport_t`, `setSensorConfigStart` and `setSensorConfigOp`. |
-| 2 | Were the timestamp report IDs and channel handling verified? | **Yes.** Checked `SENSORHUB_BASE_TIMESTAMP_REF` (0xFB), `SENSORHUB_TIMESTAMP_REBASE` (0xFA), `sensorhubInputHdlr` and `touSTimestamp`. |
-| 3 | Which defects were confirmed? | **Three.** P1: byte 1 carried a counter instead of the feature report ID. P2: completion depended on an ack the reference does not require (code divergence certain; this hub's ack behaviour still unproven). P3: IDs transposed, handled on the wrong channel, and accumulated into a persistent offset. P4–P6 were not repaired. |
-| 4 | Which source files were modified? | `src/sh2/Sh2Client.cpp`, `src/sh2/Sh2Client.h`, `src/sh2/Sh2Codes.h` and `test/native/test_main.cpp`; changes per file in §13.6. |
-| 5 | Which regression tests were added? | New: `sh2_set_feature_no_ack_wait`, `sh2_late_ack_ignored`, `sh2_base_timestamp_ref`, `sh2_timestamp_rebase`, `sh2_timestamp_rebase_signed`, `sh2_timestamp_per_payload`, `sh2_timestamp_control_ignored`. Re-baselined: `sh2_set_feature_bytes`; `sensor_init_sequence` no longer waits for an `0xFD` ack. |
-| 6 | Latest native test results? | **35 cases / 194 checks, 0 failures, `RESULT: PASS`** (MSVC 2022, `test\native\build_msvc.bat`; `build\native_tests.log`). |
-| 7 | Does the ESP32-S3 build still succeed? | **Yes.** exit 0, 0 warnings, 0 errors; 324 210 B flash (24%), 23 880 B RAM (7%) on ESP32 core 3.3.12 (`build\esp32s3_final.log`). |
-| 8 | Latest commit hash at the time of that work? | Code and tests `25deebf`; documentation `5b0034f`. This summary is committed locally on top of them and was not pushed. |
-
-**Scope.** Only the two highest-priority protocol defects from §12.7 were changed: **P1/P2**
-(set-feature payload and completion) and **P3** (timestamp reference/rebase). **P4** (INT polling),
-**P5** (recovery) and **P6** (output loss) were deliberately left untouched. There is no Phase 2
-work, no `Manager`, and no refactoring beyond what the two fixes required. The existing architecture
-(one `Sensor` → one `ShtpTransport` → one `Sh2Client` → one `BinaryEncoder`) is unchanged.
-
-### 13.1 Set-feature (P1/P2) — fixed
-
-**Reference behaviour.** `SetFeatureReport_t` is 17 bytes:
-`reportId(0xFD), featureReportId, flags, changeSensitivity(u16), reportInterval(u32),
-batchInterval(u32), sensorSpecific(u32)`. `setSensorConfigStart` calls `sendCtrl` and then
-`opCompleted` immediately; `setSensorConfigOp` declares no `.rx` handler, so `opRx` drops a
-`0xF1` for `0xFD` even if the device sends one.
-
-**Changes** (`src/sh2/Sh2Client.cpp`, `setFeature`, now lines 399–432):
-- `payload[1] = reportId;` (line 406). `nextCmdSeq_` and `(void)reportId` are gone; byte 1 no
-  longer changes between calls.
-- Completion is send success: on a successful `transport_->send` the function sets
-  `cmdState_ = Ok` and `cmdPending_ = false` (lines 422–423). No acknowledgement deadline is armed.
-- A stray `0xF1` for `0xFD` therefore reaches `handleCommandResponse` as an unsolicited response:
-  it increments `stats_.unexpectedResponses` and cannot fail or complete anything.
-- `src/sh2/Sh2Client.h` no longer declares `nextCmdSeq_`. `cmdId_`, `cmdSeq_` and
-  `cmdDeadlineUs_` remain as dormant bookkeeping; removing them would touch unrelated code.
-
-`Sensor::advanceInit` still contains its `StageSetFeature` `HubError`/`Timeout` branches
-(`BNO085Sensor.cpp:271–278`). They are now unreachable but harmless, and were left in place to keep
-the state machine untouched.
-
-### 13.2 Timestamps (P3) — fixed
-
-**Reference behaviour** (`sensorhubInputHdlr` / `touSTimestamp`): the delta is per payload;
-`0xFB` **assigns** `referenceDelta = -timebase`; `0xFA` **accumulates** `referenceDelta +=
-timebase`; `tMeas = hostInt + (referenceDelta + delay) * 100`.
-
-**Changes:**
-- `src/sh2/Sh2Codes.h:17–18`: `kBaseTimestampRef = 0xFB` (u32) and
-  `kTimestampRebase = 0xFA` (i32).
-- `src/sh2/Sh2Client.cpp` `handleReports` (248–297): both IDs are handled in the input-report
-  stream (channels 3/4). A per-payload `int64_t referenceDeltaTicks` starts at the retained
-  fallback `-120`; `0xFB` replaces it with `-timebase`; `0xFA` adds the sign-extended `timebase`.
-  The delta does not persist into the next payload.
-- `handleRotationVector` and `computeMeasTime` take `referenceDeltaTicks`
-  (`Sh2Client.cpp:299–300`, `376–382`). `tMeas = tEdgeUs + (referenceDeltaTicks + delayTicks) * 100`.
-- `rebaseOffsetUs_`, `kTimebaseReferenceUs`, `kRebaseUnitUs` and `handleTimestampRebase` were
-  removed. `handleControl` no longer has `0xFA`/`0xFB` cases.
-- `epoch_` increments on `0xFA` and on reset-complete only; a `0xFB` base reference is not a
-  discontinuity.
-- Intermediate arithmetic is `int64_t`, so a large timebase cannot saturate or overflow.
-
-### 13.3 Regression tests
-
-`test/native/test_main.cpp` now has **35 cases / 194 checks**. New or re-baselined cases:
-
-| Test | Line | Asserts |
-| --- | --- | --- |
-| `sh2_set_feature_bytes` | 453 | byte 1 = `0x05`, sensorSpecific zero, `Ok`/`!busy`, no counter drift on a second call |
-| `sh2_set_feature_no_ack_wait` | 636 | completes without `0xF1`; a later timeout poll changes nothing |
-| `sh2_late_ack_ignored` | 650 | a stray `0xF1` is counted unsolicited, not treated as success or failure |
-| `sh2_base_timestamp_ref` | 524 | `0xFB` 200 ticks → `tMeas = tEdge − 20 000 µs`; `epoch` unchanged |
-| `sh2_timestamp_rebase` | 539 | `0xFA` +50 accumulates onto the same payload's delta |
-| `sh2_timestamp_rebase_signed` | 558 | `0xFFFFFFCE` sign-extends to −50 |
-| `sh2_timestamp_per_payload` | 574 | the delta does not leak into the next payload |
-| `sh2_timestamp_control_ignored` | 592 | `0xFB` on channel 2 has no effect |
-| `sensor_init_sequence` | 669 | init advances without an `0xFD` acknowledgement |
-
-`makeTimestampReport` (line 102) builds the 5-byte `0xFA`/`0xFB` reports.
-
-### 13.4 Evidence
-
-| Check | Command | Result |
-| --- | --- | --- |
-| Host tests (MSVC 2022) | `test\native\build_msvc.bat` | 35 cases, 194 checks, 0 failures, `RESULT: PASS` (`build\native_tests.log`) |
-| ESP32-S3 compile | `arduino-cli compile --clean --verbose --warnings all --fqbn esp32:esp32:esp32s3 --library . examples/01_SingleSensor` | exit 0, 0 warnings, 0 errors; 324 210 B flash (24%), 23 880 B RAM (7%) (`build\esp32s3_final.log`) |
-| GCC host build | `sh test/native/build_gcc.sh` | **not run**: no `sh` or `g++` in this environment |
-
-The ESP32-S3 numbers are 52 bytes smaller than the §10 pre-fix figure (324 262 B). The host suite
-was also run immediately before this document update; nothing in the documentation change touches
-the build.
-
-### 13.5 Remaining limitations
-
-- **No hardware validation.** Nothing in this pass was exercised on a BNO085. Still unproven:
-  (a) whether this hub acknowledges `0xFD`, (b) the magnitude of real `0xFB` timebases,
-  (c) actual INT-to-poll latency. The fixes remove a protocol divergence; they do not prove the
-  sensor streams.
-- **Fallback delta (superseded by pass 4, §14.2).** A payload that arrives before any `0xFB` used
-  `-120` ticks (−12 ms), retained from Phase 1 to preserve prior behaviour. The reference starts at
-  0, so this was an approximation, not protocol-exact. Pass 4 changed the fallback to 0 and removed
-  the separate negative clamp.
-- **Timestamp statistics.** `stats_.baseTimestampRefs` counts every `0xFB` report; no separate
-  rebase counter exists. This is observability, not correctness.
-- **Dormant bookkeeping.** `cmdId_`, `cmdSeq_`, `cmdDeadlineUs_`, and the `StageSetFeature`
-  `HubError`/`Timeout` branches remain. They are unreachable and intentionally untouched.
-- **Unchanged findings.** P4 (INT is poll-observation, documented as INT assertion), P5 (no
-  fault-triggered recovery; attempt counter not reset) and P6 (silent output loss) remain exactly as
-  described in §12.4–§12.6. §11's list is otherwise still the backlog.
-
-### 13.6 Files changed in this pass
-
-| File | Change |
+| Area | Verdict at `e9a41ec` |
 | --- | --- |
-| `src/sh2/Sh2Client.cpp` | set-feature byte 1 and send-completion; input-channel timestamp handling; `computeMeasTime` signature and per-payload delta; removed rebase offset and control-channel cases |
-| `src/sh2/Sh2Client.h` | removed `nextCmdSeq_`, `rebaseOffsetUs_`, `handleTimestampRebase`; `int64_t referenceDeltaTicks` parameters |
-| `src/sh2/Sh2Codes.h` | corrected `kBaseTimestampRef` / `kTimestampRebase` values |
-| `test/native/test_main.cpp` | re-baselined set-feature bytes; new set-feature, ack and timestamp tests; removed ack dependency from the init sequence |
-| `output.md` | this pass-3 record and status notes |
-
-**Commit.** `25deebf` — "Fix SH-2 set-feature payload and timestamp reconstruction". It contains the
-four source/test files above; the following commit records this document.
+| Set Feature payload | **Source-verified correct** against the Hillcrest/CEVA `sh2.c` layout. 17-byte payload, 21-byte SHTP transfer, byte 1 is the feature report ID. Host test asserts the complete golden frame, including a second call's SHTP sequence. |
+| Set Feature completion | **Source-verified deliberate:** completes on a successful send, matching the reference `setSensorConfigStart`/`setSensorConfigOp` (no `.rx`). A stray `0xF1` for `0xFD` is counted as unsolicited and cannot fail the request. The hub's real ack behaviour is still unproven. |
+| Timestamp reports | **Source-verified correct** in ID, signedness, units and channel: `0xFB` = u32 base reference, `0xFA` = i32 rebase, both handled per input payload on channels 3/4. `0xFB` assigns `-timebase`; `0xFA` accumulates. The delta is local to one payload and starts at 0. |
+| `tMeasUs` arithmetic | `tMeas = (uint32_t)(tEdge + (referenceDeltaTicks + delayTicks) * 100)`. No invented clamp; wraps with the 32-bit host counter. Host-tested for the known example, zero fallback, host wrap and negative-result wrap. |
+| SHTP normal fragments | **Implemented but not positively host-tested.** Continuation fragments ≤256 B are assembled in `rxPayload_` (192 B) and delivered once complete. Only the rejection path and the oversize path have tests. |
+| SHTP oversize drain | **Implemented and host-tested**, including the 552-byte advertisement and a 2-fragment oversized continuation chain. The drain consumes the full declared length and leaves the mock stream idle. |
+| Initialization FSM | Boot → Identify → SetFeature → GetFeature → Streaming works on the mock and is host-tested end to end, including a boot with no `0xF1` ack. |
+| Recovery | **Manual only.** Nothing calls `recover()` on a fault; `update()` makes `Failed` terminal; `recover()` does **not** reset the attempt counter. This contradicts `docs/ARCHITECTURE.md` §7.4. |
+| Output | CRC-framed quaternion output is correct and host-tested. Short writes and null-sink writes are silently counted in `dropped_`; the return values are ignored and no `ERROR(OutputOverflow)` is emitted. |
+| Host tests | **39 cases / 185 checks, 0 failures, exit 0** — executed in this audit. |
+| ESP32-S3 compile | **Not executed in this audit** (`arduino-cli` is not on `PATH`). The last recorded figure is historical: 324,174 B flash / 23,880 B static RAM (pass 4). |
+| Physical validation | **None in this audit.** Product ID, set/get feature, RV streaming, timestamp reconstruction on a real stream, soak, INT-loss and cold boots remain unmeasured. |
 
 ---
 
-## 14. Pass 4 — independent re-verification (2026-11-18, uncommitted)
+## 2. Evidence actually collected
 
-### 14.0 Baseline and scope
-
-| Item | Value |
-| --- | --- |
-| Branch / HEAD | `main` / `91e537d` ("Add verification Q&A summary to output.md") |
-| Working tree at start | clean; `origin/main` matched `91e537d` |
-| Changes since audited commit `d040c8e` | `25deebf` (P1–P3 code/tests), `5b0034f` + `91e537d` (documentation), plus this pass |
-| Hardware | ESP32-S3 and BNO085 **disconnected**; COM11 unavailable. No hardware action attempted |
-| Scope | Re-verify SH-2 set-feature and timestamp reference/rebase; fix only understood, host-testable defects. No Phase 2, no `Manager` |
-
-Both protocol areas were re-read from the current source and compared with the same authoritative
-Hillcrest/CEVA `sh2.c` snapshot (`%TEMP%\sh2_ref.c`) used in pass 2. The previous pass's conclusions
-were **not** assumed; each was re-derived.
-
-### 14.1 SH-2 set feature — verified, no source change
-
-The implementation at `91e537d` already matches the reference. Re-confirmed item by item:
-
-| Field (payload offset) | Reference type | Code at HEAD | Verdict |
+| Check | Command | Exit | Result |
 | --- | --- | --- | --- |
-| `reportId` (0) | `0xFD` | `0xFD` | correct |
-| `featureReportId` (1) | sensor id | `reportId` argument (`0x05`) | correct |
-| `flags` (2) | `uint8_t` | `0x00` (no flags) | correct |
-| `changeSensitivity` (3–4) | `uint16_t` LE | 0 | correct |
-| `reportInterval_uS` (5–8) | `uint32_t` LE | interval argument LE | correct |
-| `batchInterval_uS` (9–12) | `uint32_t` LE | 0 | correct |
-| `sensorSpecific` (13–16) | `uint32_t` LE | 0 (RV has no options) | correct |
+| Repository state | `git status`; `git branch --show-current`; `git rev-parse HEAD` | 0 | `main`, HEAD `e9a41ec`, working tree clean at start |
+| Native host tests | `cmd /c "test\native\build_msvc.bat"` (output to `build\native_audit_2026-11-19.log`) | **0** | **39 cases, 185 checks, 0 failures, `RESULT: PASS`** |
+| ESP32-S3 compile | not run | — | `arduino-cli` not found on `PATH` in this environment |
+| MSVC `/analyze` | not run | — | not executed in this pass |
+| MSVC AddressSanitizer | not run | — | previously failed to link because the ASan runtime is not installed; not retried |
+| GCC host build | not run | — | no `g++`, `sh` or `clang++` on `PATH` |
+| Hardware | not attempted | — | board disconnected, COM11 unavailable |
 
-- **No command sequence field exists** in `SetFeatureReport_t`; byte 1 is the feature ID. The code
-  no longer writes a counter there, and its only sequence is the SHTP per-channel sequence.
-- **Completion:** reference `setSensorConfigStart` calls `sendCtrl` then `opCompleted` immediately;
-  `setSensorConfigOp` has no `.rx`. The code completes on a successful send, arms no ack deadline,
-  and a stray `0xF1` is counted as unsolicited. Correct.
-- **Channel/framing:** control channel 2, SHTP header length `21`, total transfer 21 bytes. The test
-  now compares the **entire** 21-byte frame, so any future offset, endianness, sequence or padding
-  regression fails.
+No test result, compile figure or hardware observation from an earlier pass is presented here
+as if it had been re-executed. Where an older figure is mentioned, it is labelled
+*historical*.
 
-No source change was needed. The existing test was strengthened rather than duplicated.
+---
 
-### 14.2 Timestamp reference/rebase — one remaining divergence fixed
+## 3. Set Feature (`Sh2Client::setFeature`)
 
-**Verified correct at HEAD:** IDs `0xFB` (base reference, `uint32_t`) and `0xFA` (rebase,
-`int32_t`); both are input-report IDs handled inside `handleReports` (channels 3/4), not the
-control channel; field offset 1, length 4, little-endian; 100 µs units; `0xFB` **assigns**
-`referenceDelta = -timebase`; `0xFA` **accumulates** the sign-extended value; the delta is local
-to the payload being parsed; `epoch_` increments on `0xFA` only.
+### 3.1 Wire layout
 
-**Confirmed defect (fallback/clamp).** `computeMeasTime` had:
+`src/sh2/Sh2Client.cpp:401–434` builds a 17-byte payload, zero-filled first
+(`Sh2Client.cpp:404–405`), then fills:
+
+| Payload offset | Size | Field | Value in code | Source line |
+| --- | --- | --- | --- | --- |
+| 0 | 1 | `reportId` | `0xFD` | 407 |
+| 1 | 1 | `featureReportId` | `reportId` argument (Sensor passes `Report::RotationVector` = `0x05`) | 408 |
+| 2 | 1 | `flags` | `0x00` (no change sensitivity, wake or always-on) | 409 |
+| 3–4 | 2 | `changeSensitivity` | 0 | 410 (zero-fill) |
+| 5–8 | 4 | `reportInterval_uS` | `intervalUs`, little-endian | 411–414 |
+| 9–12 | 4 | `batchInterval_uS` | 0 | 415 |
+| 13–16 | 4 | `sensorSpecific` | 0 | 415 |
+
+The payload is sent on the SHTP control channel (`shtp::kChannelControl` = 2,
+`ShtpProtocol.h:12`), so the transfer is 4 header bytes + 17 payload = **21 bytes**.
+`ShtpTransport::send` adds only the 4-byte SHTP header (`ShtpTransport.cpp:299–332`); no
+per-payload command sequence is inserted.
+
+This matches the reference `SetFeatureReport_t` field-for-field. There is no command-sequence
+field in that report; the only sequence on the wire is SHTP's per-channel sequence.
+
+### 3.2 Completion semantics
+
+`setFeature` sets `cmdState_ = CmdState::Ok` and `cmdPending_ = false` immediately after a
+successful `transport_->send` (`Sh2Client.cpp:421–425`). This follows
+`setSensorConfigStart` in the reference: it calls `sendCtrl` then `opCompleted`, and
+`setSensorConfigOp` declares no `.rx` handler. The granted interval is validated by the
+following get-feature exchange.
+
+Consequences, all source-verified:
+
+- No ack deadline is armed, so a missing `0xF1` cannot time out the request.
+- A stray `0xF1` for `0xFD` reaches `handleCommandResponse` with `cmdPending_ == false`
+  (`Sh2Client.cpp:182–189`), increments `stats_.unexpectedResponses`, and changes nothing.
+- `cmdId_`, `cmdSeq_` and `cmdDeadlineUs_` still exist (`Sh2Client.h:110–113`) but are now
+  dormant: `cmdPending_` is never set to true after `setFeature`, so the command-timeout
+  branch in `pollTimeouts` (`Sh2Client.cpp:476–487`) is unreachable.
+- `Sensor::advanceInit` still has `HubError`/`Timeout` branches for set-feature
+  (`BNO085Sensor.cpp:271–274`). They are unreachable but harmless.
+
+### 3.3 Host test
+
+`testSh2SetFeatureBytes` (`test/native/test_main.cpp:453–482`) asserts:
+
+- the complete first frame equals
+  `15 00 02 00 FD 05 00 00 00 60 EA 00 00 00 00 00 00 00 00 00 00`
+  (21 bytes, control channel, SHTP sequence 0, feature ID `0x05`, interval 60000 LE);
+- `cmdState() == Ok` and `!busy()` after the send;
+- a second call keeps byte 1 at `0x05` and advances only the SHTP sequence (`0x01`) and the
+  interval bytes (`10 27 00 00`).
+
+`testSh2SetFeatureNoAckWait` (`:684–696`) proves that a missing ack does not time out.
+`testSh2LateSetFeatureAckIgnored` (`:698–708`) proves that a late `0xF1` is counted
+unsolicited, not treated as success or failure.
+
+**Residual uncertainty.** Whether this hub firmware acknowledges `0xFD` at all cannot be
+established without hardware. The source no longer depends on the answer, which is the point
+of the change.
+
+---
+
+## 4. Timestamp reference and rebase
+
+### 4.1 Report IDs and channel
+
+`src/sh2/Sh2Codes.h:17–18`:
 
 ```cpp
-constexpr int64_t kDefaultReferenceDeltaTicks = -120;
-...
-int64_t t = tEdgeUs + (referenceDeltaTicks + delayTicks) * 100;
-if (t < 0) t = 0;               // invented guard
+constexpr uint8_t kBaseTimestampRef = 0xFB;  // device -> host, u32 timebase
+constexpr uint8_t kTimestampRebase  = 0xFA;  // device -> host, i32 timebase
 ```
 
-The reference initialises `referenceDelta = 0` for every payload (`sensorhubInputHdlr` line 549),
-so `-120` was a Phase-1 approximation, not the protocol formula. The `t < 0 → 0` clamp also has no
-counterpart in the reference, which accumulates into a `uint64_t`.
+Both IDs have a 5-byte entry in `kReportLengths` (`Sh2Codes.cpp:62–63`,
+`kTimestampRefLen`). They are processed in `Sh2Client::handleReports`
+(`Sh2Client.cpp:249–298`), which is the handler for the input-report channels 3 and 4
+(`handlePayload`, `:64–67`). On the control channel they are length-skipped by
+`handleControl` and only logged at debug level; they do not mutate any timestamp state.
+A host test pins that behaviour (`testSh2TimestampOnControlChannelIgnored`, `:589–600`).
 
-**Derivation of the correct result.** The reference computes
+### 4.2 Per-payload delta
 
+`handleReports` declares `int64_t referenceDeltaTicks = 0` at the start of **each** payload
+(`Sh2Client.cpp:251–253`). Then, walking the concatenated reports:
+
+- `0xFB` (`:269–278`): `referenceDeltaTicks = -static_cast<int64_t>(timebase)`; increments
+  `stats_.baseTimestampRefs`; does **not** increment `epoch_`.
+- `0xFA` (`:279–289`): `referenceDeltaTicks += static_cast<int32_t>(readU32(...))`;
+  increments `epoch_`.
+- `0x05` (`:290–291`): decode the Rotation Vector with the current delta.
+- anything else: forwarded to `handlers_.sensorReport` if one is registered; `Sensor` leaves
+  it `nullptr` (`BNO085Sensor.cpp:67`), so other reports are skipped but parsing continues
+  because their lengths are known.
+
+The delta does not persist into the next payload. This matches the reference
+`sensorhubInputHdlr` (`referenceDelta = 0` per payload; `0xFB` assigns; `0xFA` accumulates).
+
+### 4.3 Measurement-time arithmetic
+
+`computeMeasTime` (`Sh2Client.cpp:377–385`):
+
+```cpp
+const int64_t t = static_cast<int64_t>(tEdgeUs) +
+                  (referenceDeltaTicks + delayTicks) * kTimestampTickUs;
+return static_cast<uint32_t>(t);
 ```
-timestamp = (rollovers << 32) + hostInt + (referenceDelta + delay) * 100
-```
 
-where the arithmetic before the 64-bit accumulation is unsigned 32-bit in C. The exported
-`Quaternion::tMeasUs` is 32 bits, i.e. the low 32 bits of that value. Therefore:
+with `kTimestampTickUs = 100` (`:15`). There is no negative clamp and no `-12000 µs`
+constant. The result keeps the low 32 bits, so it wraps exactly like the host `micros()`
+counter. Intermediate arithmetic is `int64_t`, so a large `0xFB` timebase cannot saturate.
 
-```
-tMeasUs = (uint32_t)(tEdgeUs + (referenceDeltaTicks + delayTicks) * 100)
-```
+### 4.4 What `tHostUs` actually is
 
-with `referenceDeltaTicks` starting at 0 and changed only by `0xFB`/`0xFA` in the same payload.
-No clamp. This wraps exactly like the host `micros()` counter.
+`q.tHostUs = tUs` (`Sh2Client.cpp:325`). `tUs` is the timestamp passed to the transport
+handler, which `Sensor::serviceBus` latches from `hal_.timeUs()` on the **first poll
+observation** of INT (`BNO085Sensor.cpp:165–174`) and reuses for every packet drained in that
+visit (`:189`). It is therefore **poll-observation time, not hardware H_INTN assertion
+time**. See §7 and §8 for the documentation conflict.
 
-**Fix** (`src/sh2/Sh2Client.cpp`): `kDefaultReferenceDeltaTicks = 0`; `computeMeasTime` returns
-`static_cast<uint32_t>(t)` without the clamp; comments now cite the reference formula and the
-32-bit truncation. No other timestamp behaviour changed.
-
-**Worked examples used as tests**
-
-| Input | Expected `tMeasUs` | Why |
-| --- | --- | --- |
-| `0xFB` timebase 120, delay 150, `tEdge` 1 000 000 | 1 003 000 | `1 000 000 + (−120 + 150) × 100` |
-| no `0xFB`, delay 0, `tEdge` 123 456 | 123 456 | fallback delta is 0 |
-| no `0xFB`, delay 10, `tEdge` `0xFFFFFF00` | 744 (`0x2E8`) | `0xFFFFFF00 + 0x3E8` truncated to 32 bits |
-| `0xFB` timebase 200, delay 0, `tEdge` 1000 | `0xFFFFB5C8` | `1000 − 20 000`, low 32 bits |
-
-### 14.3 Other areas inspected
-
-Re-read without changing: SHTP framing/sequence/oversize drain (`ShtpTransport.cpp`), SPI lock and
-CS release (`SpiBusManager.cpp`, `Esp32SpiHal.cpp`), bounded waits and INT polling
-(`BNO085Sensor.cpp`), per-sensor state isolation, recovery/backoff, RV/Q14 decode
-(`Sh2Reports.cpp`), CRC-16/CCITT-FALSE (`Crc16.cpp`), output short-write handling
-(`BinaryEncoder.cpp`) and buffer sizes (`BNO085Config.h`). No new defect was found that was both
-certain and safely fixable without hardware.
-
-**Rejected / uncertain findings**
-
-- Set-feature ack behaviour of real hub firmware remains **unproven**; the reference divergence is
-  resolved, but the device has never been observed.
-- `recover()` attempt-counter reset (P5) and silent output loss (P6) are confirmed design gaps from
-  §12.4–§12.6, but fixing them changes recovery/observability policy beyond this pass. Left open.
-- INT polling vs documented ISR (P4) is a documentation/code mismatch, not a protocol error. Left
-  open deliberately.
-- The example prints `tHostUs - tMeasUs` as an unsigned latency. With the corrected fallback this
-  can underflow when `delay > 0` and no `0xFB` is present. It is a diagnostic display issue only;
-  flagged for review, not changed (see §14.7).
-
-### 14.4 Regression tests
+### 4.5 Host tests
 
 `test/native/test_main.cpp`:
 
-- `sh2_set_feature_bytes` now compares the complete first frame:
-  `15 00 02 00 FD 05 00 00 00 60 EA 00 00 00 00 00 00 00 00 00 00`, and a second call is compared
-  against the same frame with SHTP sequence `01` and interval `10 27 00 00`. This covers every
-  payload byte and both completions.
-- New `sh2_timestamp_known_example`: `0xFB` + delay in one payload → 1 003 000 µs.
-- New `sh2_timestamp_no_reference`: no reference → delta 0 → `tEdge` unchanged.
-- New `sh2_timestamp_host_wrap`: host-counter wrap → low 32 bits (744).
-- New `sh2_timestamp_before_zero`: negative result → two's-complement low 32 bits.
-- Existing expectations were re-baselined from the old −120 fallback: `sh2_rotation_vector_decode`
-  now expects 100 000 instead of 88 000; the delay-field case 130 000 instead of 118 000; the
-  per-payload case 200 000 instead of 188 000; the control-channel case 100 000 instead of 88 000.
-
-The suite is **39 cases / 185 checks**. It covers the init FSM, timeouts, malformed/oversized
-transfers, recovery backoff, CRC, framing, decode and the two protocol areas.
-
-### 14.5 Exact evidence
-
-| Check | Exact command | Exit | Result |
-| --- | --- | --- | --- |
-| Native host tests | `cmd /c "test\native\build_msvc.bat"` | 0 | **39 cases, 185 checks, 0 failures, `RESULT: PASS`** (`build\native_tests.log`) |
-| ESP32-S3 compile | `arduino-cli compile --fqbn esp32:esp32:esp32s3 --build-path build\esp32s3_verify --library . --clean --warnings all --verbose examples\01_SingleSensor` | 0 | **324 174 B flash (24 %)**, **23 880 B RAM (7 %)**, 0 warnings, 0 errors (`build\esp32s3_verify.log`) |
-| MSVC static analysis | `cmd /c "build\analyze_msvc.bat"` (`cl /analyze` over all core `.cpp`) | 0 | no diagnostics (`build\msvc_analyze.log`) |
-| MSVC AddressSanitizer | `cmd /c "build\asan_msvc.bat"` | 1 | **not run**: `LNK1104: cannot open file 'clang_rt.asan_static_runtime_thunk-x86_64.lib'` — ASan runtime not installed (`build\msvc_asan.log`) |
-| GCC host build | `sh test/native/build_gcc.sh` | — | **not run**: no `sh`, `g++`, `clang++`, `clang-tidy` or `cppcheck` in this environment |
-
-The ESP32-S3 image is 36 B smaller than pass 3 (324 210 B), consistent with removing the clamp
-branch. RAM is unchanged. `build\analyze_msvc.bat` and `build\asan_msvc.bat` are local helper
-scripts under the ignored `build/` directory; they are not part of the library.
-
-### 14.6 Remaining limitations
-
-- **No hardware evidence.** Product-ID retrieval, set/get feature, Rotation Vector streaming,
-  timestamp reconstruction in a real stream, INT latency and soak/cold-boot behaviour remain
-  unmeasured. This pass changes software only.
-- **P4 (INT polling)** — `tHostUs` is poll-observation time; README/API/ARCHITECTURE describe
-  INT-assertion time. Open.
-- **P5 (recovery)** — no fault-triggered `recover()`; the attempt budget is not reset inside
-  `recover()`. Open.
-- **P6 (output loss)** — short writes are not surfaced and `dropped_` is not a true loss counter.
-  Open.
-- **Timestamp observability** — only `stats_.baseTimestampRefs` exists; there is no rebase counter.
-- **Example diagnostic** — `tHostUs - tMeasUs` can underflow as an unsigned value in the text
-  example (see §14.7); it does not affect the binary record, which carries both timestamps.
-- **Set-feature ack** — the reference treatment is implemented, but whether this hub emits `0xF1`
-  for `0xFD` cannot be known without hardware.
-
-### 14.7 Files changed and review notes (uncommitted)
-
-| File | Change | Review sensitivity |
+| Test | Line | Asserts |
 | --- | --- | --- |
-| `src/sh2/Sh2Client.cpp` | fallback delta `-120 → 0`; removed `t < 0` clamp; comment now cites `touSTimestamp` and 32-bit truncation | **Review:** this intentionally changes `tMeasUs` for payloads without a `0xFB` and for negative results. It is reference-exact, but it changes the observable value relative to pass 3 |
-| `test/native/test_main.cpp` | full golden 21-byte set-feature frame + second frame; four new timestamp cases; four re-baselined expectations; registry entries | Review test expectations against §14.2 |
-| `output.md` | this §14, pass-4 status notes, Appendix B constant | Documentation only |
-| `README.md` | host-test count, build size, timestamp formula | Check wording matches §14.2 |
-| `test/native/README.md` | coverage row mentions reference-exact timestamp cases | Documentation only |
+| `sh2_base_timestamp_ref` | 520–533 | `0xFB` 200 ticks → `tEdge − 20 000 µs`; `epoch` unchanged |
+| `sh2_timestamp_rebase` | 535–552 | `0xFB` then `0xFA +50` → delta `−150`; `epoch` increments |
+| `sh2_timestamp_rebase_signed` | 554–568 | `0xFFFFFFCE` sign-extends to −50 |
+| `sh2_timestamp_per_payload` | 570–587 | the delta does not leak into the next payload |
+| `sh2_timestamp_control_ignored` | 589–600 | `0xFB` on channel 2 has no effect |
+| `sh2_timestamp_known_example` | 602–614 | `1 000 000 + (−120 + 150) × 100 = 1 003 000` |
+| `sh2_timestamp_no_reference` | 616–624 | no reference → delta 0 → `tEdge` unchanged |
+| `sh2_timestamp_host_wrap` | 626–637 | host-counter wrap → low 32 bits (744) |
+| `sh2_timestamp_before_zero` | 639–651 | negative result → two's-complement low 32 bits |
 
-Nothing was staged, committed, amended, rebased or pushed. `git status` also shows the ignored
-`build/` outputs; those are not source changes.
+All pass in the executed suite.
 
-**Needs user review:** (1) the fallback/clamp semantics in `Sh2Client.cpp`; (2) whether to keep the
-32-bit truncation or widen `Quaternion::tMeasUs` (a wire-format change, deliberately not done);
-(3) the example's unsigned `dt` display; (4) whether P4–P6 should be scheduled next.
+**Residual uncertainty.** The magnitude of real `0xFB` timebases, the real 100 µs delay
+scale, and the INT-to-poll latency remain unmeasured. There is no separate rebase counter in
+`Sh2Client::Stats`; only `baseTimestampRefs` exists (`Sh2Client.h:38–47`).
 
-### 14.8 Hardware validation procedure (when the board is reconnected)
+---
 
-1. Wire per the baseline (SCK 12, MOSI 11, MISO 13, CS 10, INT 9, RST 8; PS0/PS1 high), common
-   ground, 3.3 V, SPI mode 3 at 1 MHz.
-2. Flash `examples/01_SingleSensor` with `BNO085_BINARY_OUTPUT 0`; open serial at 115 200 baud.
-3. Expect `BNO085Multi phase-1 baseline started`, the channel-0 advertisement drained on boot, and
-   eventually `[Streaming]`. Press `d`: record product ID, firmware version, `granted=10000us`,
-   packet/error counters.
-4. Confirm Rotation Vector lines arrive at ≈100 Hz; press `q` and check a unit-norm quaternion and
-   accuracy. Record `tMeas` and `dt` for at least 100 reports.
-5. Timestamp check: compare consecutive `tMeas` deltas with the configured 10 ms interval. Confirm
-   `tMeas` stays monotonic modulo 32-bit wrap and that `tHostUs` is close to `micros()` at
-   reception. If a `0xFB` is visible in logs, verify the delta maps device time to host time.
-6. Fault checks: temporarily disconnect INT → expect `Degraded` + one `ERROR`, then reconnect;
-   press `r` to exercise recovery and confirm the attempt/backoff path. Power-cycle 10 times and
-   record whether every boot reaches `Streaming`.
-7. Only then mark stages 3+ as physically tested. Record actual values; do not reuse the host-test
-   expectations as hardware evidence.
+## 5. SHTP framing, reassembly and draining
+
+### 5.1 Receive path (`ShtpTransport::service`, `ShtpTransport.cpp:77–279`)
+
+1. If `hal_->intAsserted()` is false, return `NoData` (`:78–79`).
+2. Peek 4 bytes (`readRaw(peek, 4)`, `:81–86`). The design assumes the device re-presents
+   the transfer from its header on a new CS assertion; the mock encodes that assumption
+   (`test/native/mock_hal.h:58–62`).
+3. Parse `rawLength` (`bit 15 = continuation`), `channel = peek[2]`, `sequence = peek[3]`
+   (`:88–94`).
+4. Reject/consume:
+   - `length == 0` → `Spurious` (`:104–108`);
+   - reserved `0xFFFF` → `badFragments++`, `discard(length)` (`:110–116`);
+   - `length < 4` → `shortFragments++`, `discard` (`:118–124`);
+   - `channel >= 8` → `badChannels++`, `discard` (`:126–132`).
+5. Sequence tracking is diagnostic only (`:134–144`).
+6. If `length > sizeof(rxTransfer_)` (256), take the oversize path (§5.3).
+7. Otherwise read the full `length` bytes (header repeated + payload) into `rxTransfer_`
+   (`:207–211`), count `packets`/`bytes`, and record `lastChannel`/`lastLength`/
+   `lastTimestampUs` (`:213–217`).
+8. Assemble payload (`:221–267`):
+   - `payloadLen = length - 4`;
+   - a continuation must have an assembly in progress, the same channel, and
+     `payloadLen <= inRemaining_`, otherwise `badFragments++` and reset (`:223–233`);
+   - a non-continuation transfer aborts any partial assembly and starts a new one
+     (`:234–246`);
+   - copy into `rxPayload_`; if `payloadLen` exceeds the remaining buffer space (192 B
+     total), count `oversizePayloads`, reset and return `Oversize` (`:248–259`);
+   - when `inRemaining_ == 0`, invoke the handler once with the assembled payload and the
+     timestamp captured when the first fragment arrived (`:265–278`).
+
+### 5.2 Normal fragments
+
+The positive reassembly path exists and is source-verified. However, the current registry
+contains **no positive two-fragment reassembly test**: `shtp_unexpected_continuation`
+(`test_main.cpp:409–416`) tests rejection, and the two oversize tests exercise the drain,
+not `rxPayload_` assembly. `test/native/README.md:34` claims continuation coverage; only
+the rejection side is covered.
+
+### 5.3 Oversize drain (`ShtpTransport.cpp:146–205`)
+
+When the transfer itself is larger than 256 bytes:
+
+- `oversizePayloads++` (`:151`);
+- drain exactly `length` bytes in ≤256-byte chunks (`:162–176`). The 4-byte peek consumed
+  nothing, so the whole transfer, header included, must be clocked out;
+- if the continuation bit is set, peek the next 4-byte header, require the same channel and
+  `lenNext >= 4`, then drain exactly `lenNext` bytes for that fragment (`:177–198`);
+- bound the chain to 8 continuation fragments (`guard`, `:178–181`);
+- return `Oversize` (`:204`).
+
+The comment at `:158–161` records the original defect: draining `length - 4` stranded the
+last four payload bytes, which the device re-presented, and every later `service()` parsed
+payload as a header.
+
+### 5.4 Host tests
+
+`test/native/test_main.cpp`:
+
+| Test | Line | Asserts |
+| --- | --- | --- |
+| `shtp_valid_rotation_vector` | 288–303 | one complete transfer, channel, length, timestamp, payload, packet count |
+| `shtp_no_data` | 305–309 | INT low → `NoData` |
+| `shtp_zero_length` | 311–317 | length 0 → `Spurious` |
+| `shtp_short_fragment` | 319–325 | length < 4 → `Malformed`, `shortFragments == 1` |
+| `shtp_reserved_length` | 327–332 | `0xFFFF` → `Malformed`, `badFragments == 1` |
+| `shtp_bad_channel` | 334–341 | channel 9 → `Malformed`, `badChannels == 1` |
+| `shtp_oversize_transfer` | 343–350 | 300-byte transfer → `Oversize`, nothing delivered |
+| `shtp_payload_too_large` | 352–360 | 200-byte payload (fits transfer, not payload buffer) → `Oversize` |
+| `shtp_oversize_drain_complete` | 362–390 | 552-byte advertisement fully consumed, queue empty, idle afterwards, next report decodes |
+| `shtp_oversize_continuation` | 392–407 | two oversized fragments drained by their own lengths, idle afterwards |
+| `shtp_unexpected_continuation` | 409–416 | continuation with no assembly → `Malformed` |
+| `shtp_bus_error` | 418–424 | failed transfer → `BusError`, `rxErrors == 1` |
+| `shtp_sequence_gap` | 426–435 | gap counted, not repaired |
+
+### 5.5 Unhandled interactions and edge cases (source-verified, not tested)
+
+- **Oversize while an assembly is in progress.** The oversize branch returns before touching
+  `inRemaining_`/`inCursor_` (`:146–205`). If a payload has a small fragment followed by an
+  oversized fragment, the stale assembly is not cancelled, and later fragments can be
+  appended to it. No test covers this.
+- **`discard()` is capped at 1024 bytes** (`4 × sizeof(rxTransfer_)`, `:67`). The reserved
+  length is 32,767 bytes, so a genuinely long malformed transfer can leave bytes on the wire
+  and desynchronise the next `service()`.
+- **Continuation header mismatch.** If the next fragment has a different channel or
+  `lenNext < 4`, the drain counts `badFragments` and breaks (`:190–193`). The peek is
+  non-consuming by design, so the bytes remain for the next `service()`; recovery depends on
+  the device re-presenting them correctly.
+- **Two different conditions share one counter.** `oversizePayloads` counts both a
+  transfer larger than 256 B (`:151`) and a payload larger than the remaining 192-byte
+  buffer (`:251`).
+
+---
+
+## 6. Initialization, recovery and output
+
+### 6.1 Initialization state machine
+
+`Sensor::begin` (`BNO085Sensor.cpp:22–96`) validates only: `csPin >= 0`,
+`report == RotationVector`, `intervalUs >= kMinIntervalUs` and `reportsValid()`,
+`0 < spiHz <= kSpiMaxHz`. It does not validate a sensor count, distinct CS pins,
+`csPin != intPin/resetPin`, or `resetGroup`; there is no `Manager` in Phase 1.
+
+`update()` (`:139–163`) returns immediately for `Failed`, `Disabled` and `Unconfigured`.
+Otherwise it services the bus, polls SH-2 timeouts, advances init, checks silence and emits a
+periodic status frame.
+
+`advanceInit` (`:222–307`):
+
+| Stage | Condition | Action |
+| --- | --- | --- |
+| `StageBoot` | `shtp_.stats().packets > bootPacketBaseline_` | → `StageIdentify`, state `Identifying`, 100 ms deadline |
+| `StageBoot` | boot deadline reached | `Failed(BootTimeout)` |
+| `StageIdentify` | `productInfo().valid` | → `StageSetFeature`, state `Configuring` |
+| `StageIdentify` | deadline reached | `Failed(Sh2Timeout)` |
+| `StageIdentify` | not busy and retry due | send `0xF9 0x00`, retry every 10 ms |
+| `StageSetFeature` | not yet sent | send set-feature; break |
+| `StageSetFeature` | `cmdState() == Ok` | → `StageGetFeature` |
+| `StageSetFeature` | `HubError` / `Timeout` | `Failed(Sh2BadResponse)` / `Failed(Sh2Timeout)` (unreachable after the send-completion change) |
+| `StageSetFeature` | not busy and retry due | resend |
+| `StageSetFeature` | stage deadline | `Failed(Sh2Timeout)` |
+| `StageGetFeature` | not yet sent | send `0xFE 0x05` |
+| `StageGetFeature` | `featureState() == Ok` | `enterStreaming()` |
+| `StageGetFeature` | `HubError` or `Timeout` | `Failed(Sh2BadResponse)` |
+| `StageGetFeature` | stage deadline | `Failed(Sh2Timeout)` |
+
+`enterStreaming` (`:309–327`) records the granted interval, resets `recoveryAttempts_`,
+sets `Streaming`, and emits `INIT_RESULT` with result 0.
+
+Important behavioural detail: the boot stage advances on **any complete SHTP packet**. The
+552-byte channel-0 advertisement is oversized, returns before `++stats_.packets`, and does
+not count; in practice the reset-complete packet on channel 1 advances the stage. The state
+machine does not parse the advertisement or a channel-2 initialisation message, and
+`onResetComplete` returns early while in `StageBoot`/`StageIdentify` (`:446–450`).
+
+### 6.2 Recovery
+
+- `recover()` (`:369–394`) is manual. It returns `SensorFailed` once
+  `recoveryAttempts_ >= maxAttempts`; otherwise increments the counter, sets `Recovering`,
+  and schedules `startBoot()` after the backoff.
+- `update()` treats `Failed` as terminal (`:141–144`), so a fault never triggers recovery by
+  itself.
+- `recover()` does **not** reset `recoveryAttempts_`. The counter is reset in `begin()`
+  (`:82`) and `enterStreaming()` (`:314`). This contradicts `docs/ARCHITECTURE.md:410`
+  ("`recover(i)` … resets the attempt counter").
+- A successful `startBoot()` after backoff re-enters `StageBoot`; failures then go through
+  the same `enterFailed` paths.
+- `checkSilence` (`:329–346`) sets `Degraded`, records `NoReports` and emits one `ERROR`
+  frame. `Degraded` self-clears on the next report (`:434–439`). No recovery is attempted.
+- `resetOnBootTimeout`, `resetGroup`, per-index phase offset and automatic reconfiguration
+  are not implemented.
+
+### 6.3 Output encoder
+
+`BinaryEncoder::emit` (`BinaryEncoder.cpp:25–65`) writes
+`A5 5A | ver | type | len(u16) | seq(u16) | payload | CRC16(u16)`, with CRC-16/CCITT-FALSE
+over `[2, 8+N)`. `writeQuaternion` (`:79–98`) emits the 24-byte payload documented in
+`docs/API.md` §4.3 and is host-tested at the byte level (`test_main.cpp:242–286`).
+
+Source-verified output gaps:
+
+- Every `write*` return value is ignored by `Sensor`. A short write increments `dropped_` and
+  logs, but no status bit or `ERROR(OutputOverflow)` is produced. The frame sequence is
+  incremented *before* the write (`:43`), so a dropped frame still consumes a sequence
+  number.
+- When `emitBinaryFrames` is false, `begin()` attaches `nullptr` (`BNO085Sensor.cpp:56`), so
+  `writeHello`, `INIT_RESULT` and `ERROR` increment `dropped_` even though nothing was meant
+  to be written. `dropped_` therefore means "write not performed", not "frame lost".
+- `writeManagerDiagnostics` (`BinaryEncoder.cpp:142–157`) exists but is never called.
+- `SENSOR_STATUS` is emitted only by `emitStatusIfDue` (`BNO085Sensor.cpp:348–354`), i.e.
+  periodically; it is not emitted on a state change, contrary to `docs/API.md:356`.
+- Its payload offset 8 is `reportsDecoded` (`BinaryEncoder.cpp:123`), while `docs/API.md:415`
+  documents `rxPackets`.
+- `Diagnostics::product`, `csTransactions`, `spiTransfers`, `busTimeouts` and
+  `transferBytes` are declared (`BNO085Types.h:200–212`) but never written. The example prints
+  `product.partNumber` (`examples/01_SingleSensor/01_SingleSensor.ino:59–64`), which is
+  therefore always zero.
+- `SpiBusManager::lockTimeouts_` is counted (`SpiBusManager.cpp:102–104`) but never surfaced
+  in `Diagnostics`.
+
+### 6.4 Other source-verified notes
+
+- `disable()` only sets `State::Disabled`; it sends nothing to the device, which continues
+  streaming and asserting INT.
+- `configure()` sends a new set-feature but does not itself run a get-feature to confirm the
+  granted interval.
+- `Sensor::end()` drives CS high and clears `started_`; it does not reset SHTP/SH-2 or the
+  bus manager.
+- `begin()` writes `HELLO` with `sensorCount = 1` hardcoded (`:85`).
+- `cmdId_`, `cmdSeq_`, `cmdDeadlineUs_` are dormant (§3.2).
+- The example prints `tHostUs - tMeasUs` as an unsigned value
+  (`01_SingleSensor.ino:164–170`); it can underflow when `delay > 0` and no `0xFB` is present.
+  This affects only the text diagnostic, not the binary record.
+
+---
+
+## 7. Source-verified defects and gaps (current, unfixed)
+
+These are current facts at `e9a41ec`, not historical pass-1 findings.
+
+| # | Gap | Evidence | Impact |
+| --- | --- | --- | --- |
+| D1 | INT is polled, not an ISR | `Esp32SpiHal::intAsserted` is `digitalRead`; `Sensor::serviceBus` latches on first poll | `tHostUs`/`tMeasUs` are late by up to one loop period; docs claim assertion time |
+| D2 | No fault-triggered recovery; `Failed` is terminal | `Sensor::update` `:141–144`; `recover()` only called by the example's `r` key | Any transient fault is a permanent outage until the application intervenes |
+| D3 | `recover()` does not reset the attempt budget | `Sensor::recover` `:369–394` | Five manual retries exhaust the budget permanently |
+| D4 | Output loss is silent | `BinaryEncoder::emit` `:53–61`; callers ignore the result | Consumer sees a sequence gap with no error frame or surfaced counter |
+| D5 | `dropped_` is not a loss counter | `BinaryEncoder.cpp:27–30`; null sink when binary output is off | Misleading if exposed |
+| D6 | Product/diagnostic fields are dead | `Diagnostics` fields never written; example prints `product.partNumber` | Diagnostics display is misleading |
+| D7 | `MANAGER_DIAGNOSTICS` is never emitted | `writeManagerDiagnostics` has no caller | PC never receives manager diagnostics |
+| D8 | `SENSOR_STATUS` is periodic only and offset 8 differs from the API | `emitStatusIfDue`; `BinaryEncoder.cpp:123` | Status semantics diverge from `API.md` |
+| D9 | No product-ID gate | `handleProdId` sets `valid` on the first `0xF8` (`Sh2Client.cpp:138–175`) | Configures before all entries arrive; `ProductIdMismatch` is never produced |
+| D10 | `resetGroup` and `allowGrvFallback` are dead | Declared in `BNO085Types.h:267,271`; never read | Shared-reset and fallback behaviour described in the docs do not exist |
+| D11 | Extra reports are accepted but ignored | `enable()` stores extras; `advanceInit` sends only the primary; `get()` returns false; `sensorReport` is null | Silent no-op for optional reports |
+| D12 | Oversize during in-progress assembly is not cancelled | `ShtpTransport.cpp:146–205` returns without clearing `inRemaining_` | Possible stale assembly / misframed following fragments |
+| D13 | `discard()` caps at 1024 bytes | `ShtpTransport.cpp:67` | A long malformed transfer can desynchronise the stream |
+| D14 | Bus-lock timeouts are not surfaced | `SpiBusManager.cpp:102–104`; no `Diagnostics` write | `busBusy`/`BusTimeout` diagnostics are unavailable |
+| D15 | `disable()` does not stop the device | `BNO085Sensor.cpp:413–419` | Device keeps streaming and asserting INT |
+| D16 | Set-feature hub ack behaviour is unproven | No hardware | Source no longer depends on it, but the device's real behaviour is unknown |
+| D17 | Normal fragment reassembly has no positive test | Registry has only rejection + oversize cases | A regression in `rxPayload_` assembly would not be caught |
+| D18 | Example latency display can underflow | `01_SingleSensor.ino:164–170` | Cosmetic diagnostic error |
+
+---
+
+## 8. Documentation consistency audit
+
+The documents are a mixture of approved Phase 0 design, Phase 1 delivery notes and
+historical evidence. The table lists every material contradiction with the current code. It
+does **not** count Phase 2+ material that is explicitly labelled as future work, except where
+the document states or implies that Phase 1 already implements it.
+
+### 8.1 `README.md`
+
+| Line | Statement | Current code | Verdict |
+| --- | --- | --- | --- |
+| 8 | "compiles for the ESP32-S3 and passes its host tests" | Host tests pass (39/185). Compile was not re-executed here. | Host-tested part verified; compile claim is historical |
+| 21 | "324 174 B flash (24 %), 23 880 B static RAM (7 %)" | Not re-compiled in this audit | Historical, unverified here |
+| 22 | "39 cases / 185 checks, 0 failures" | Executed: exactly 39/185, 0 failures | **Accurate** |
+| 24 | Physical stages 1–2 and drain evidence | No hardware in this audit | Historical; not new evidence |
+| 121–127 | `tMeas = tEdge + (referenceDelta + delayTicks) × 100`, delta starts at 0, `0xFB` replaces with `−timebase`, `0xFA` accumulates | Matches `Sh2Client.cpp:249–298, 377–385` | **Accurate** |
+| 137 | "Fragmented payloads are drained and counted, not reassembled" | Normal fragments **are** reassembled (`ShtpTransport.cpp:221–267`); only oversized transfers are drained | **Wrong** |
+| 24 | "552 B channel-0 advertisement is drained in 4 bus transactions" | Historical hardware result; code path matches | Historical |
+| 83 | `test/hardware/02_TransportDrain` exists | File exists | Accurate |
+
+### 8.2 `docs/PHASE1-NOTES.md`
+
+| Line | Statement | Current code | Verdict |
+| --- | --- | --- | --- |
+| 27 | Deviation 4: "`tMeas = tEdge - 12000 us + delayTicks * 100` plus a rebase offset" | Current code starts at 0, applies `0xFB`/`0xFA` per payload, no `−12000`, no persistent rebase offset | **Outdated** (the superseded note at 33–37 mentions it, but the row itself is wrong) |
+| 28 | Deviation 5: "Oversize transfers are drained … the payload is not assembled" | Normal fragments are assembled; only oversized transfers are drained | **Partly wrong**; the superseded note does not correct this row |
+| 55–58 | "168 checks across 30 cases" and "(Current count: 39 cases / 185 checks)" | Executed 39/185 | Historical + current count is correct |
+| 85 | Procedure: "30 cases / 168 checks" | Historical delivery figure | Historical, not current |
+| 121 | "324 262 B flash (24 %), 23 880 B static RAM (7 %)" | README gives 324 174 B; not re-compiled here | **Stale/inconsistent with README** |
+| 137–139 | Open item: "confirm the 12 000 µs edge-to-reception offset … then decide whether the 0xFA rebase is needed" | Offset removed; `0xFA` rebase implemented per reference | **Outdated open item** |
+| 48/52 | Boot 93 665 µs; drain 4 transactions (peek + 256 + 256 + 40) | Historical hardware evidence | Consistent with README |
+
+### 8.3 `docs/ARCHITECTURE.md`
+
+| Line | Statement | Current code | Verdict |
+| --- | --- | --- | --- |
+| 169, 306–312, 436; 6.4 | ISR on `FALLING`, atomic pending mask, `edgeUs[i] = micros()` | Polls `digitalRead`; no `attachInterrupt`; latches first observation | **Contradiction** (D1) |
+| 154 | "IdentifyChk: gate on known-good part number" | `product_.valid` set on first `0xF8`; no gate; `ProductIdMismatch` never produced | **Contradiction** (D9) |
+| 381–384 | State machine consumes advertisement + reset-complete + channel-2 init message before configuring | Boot advances on any complete packet; advertisement is oversize and does not count; reset-complete early-returns in Boot/Identify; no init-message handling | **Contradiction** |
+| 277 | CS deasserted via RAII guard | No RAII guard; no early return between CS low/high, so the invariant holds in practice | **Partly wrong** (implementation detail) |
+| 297–298 | Lock timeout → sensor skipped, `diag.busBusy++` | `lockTimeouts_` counted in `SpiBusManager`; not mirrored to `Diagnostics` | **Contradiction** (D14) |
+| 320–346 | Cross-sensor round-robin, cursor, fairness, stuck-INT counter | No `Manager`; per-sensor loop only; no stuck-INT counter | **Phase 2 not implemented** |
+| 355 | SH-2 timeout → `Degraded` | `enterFailed` sets `Failed` | **Contradiction** |
+| 365–372, 416–423 | Reset groups / shared NRST behaviour | `resetGroup` never read | **Not implemented** (D10) |
+| 388–398 | Failure detection: 3 consecutive invalid headers, malformed counter → `Degraded`, product-ID gate | None of these exist; faults go to `Failed` or only increment counters | **Contradiction** |
+| 400–414 | Automatic recovery FSM, backoff with `(index × 37 ms)` phase offset, `recover()` resets attempts, status frame per attempt | Manual recovery only; no phase offset; attempts not reset; no status frame per attempt | **Contradiction** (D2/D3) |
+| 451 | One request in flight, matched by report ID + command sequence, 100 ms deadline | Per-operation pending flags; command sequence is only logged; set-feature has no request in flight; product ID is matched by nothing | **Contradiction** |
+| 453 | Single `new Sensor[n]` allocation | No `Manager` or allocation in Phase 1 | **Phase 2 not implemented** |
+| 450 | Stateless CEVA decoder vendored as optional path | `src/sh2/third_party/ceva/` is absent | **Not present** |
+| 467 | `begin(configs, n)` for 1–20 sensors | `Sensor::begin` is per sensor; no manager | **Not implemented** |
+| 183 | `tMeas = T_int − referenceDelta + delay·100` | Code uses `tEdge + (referenceDelta + delay) × 100`, where `referenceDelta = −timebase` on `0xFB` | **Sign convention is ambiguous/contradictory** with README §121–127 |
+
+### 8.4 `docs/API.md`
+
+| Line | Statement | Current code | Verdict |
+| --- | --- | --- | --- |
+| 138–163 | `ManagerConfig` has `SPIClass* spi`, `Stream* output`, `OutputMode outputMode` | Actual struct has `IOutputSink* output`, `ILogSink* log`, `bool emitBinaryFrames`; no `spi` or `outputMode` | **Contradiction** |
+| 212–228 | `Diagnostics` fields (`productId`, `fwMajor/minor/patch`, `rxPackets`, `busBusy`, `shortPackets`, `recoveryAttempts`, …) | Different field names/types (`ProductInfo product`, `shtpPackets`, `shortFragments`, no `busBusy`, no `recoveryAttempts`) | **Contradiction** |
+| 121–130 | `begin()` enforces sensor count, distinct CS, `csPin != intPin/resetPin` | `Sensor::begin` enforces only per-sensor `csPin >= 0`, report, interval, `reportsValid()`, `spiHz` | **Contradiction** |
+| 260–279 | `Manager` class and `next(Record&)` | No `Manager`, no aggregation | **Phase 2 not implemented** |
+| 179, 378 | `tHostUs` = `micros()` at INT assertion | Poll-observation time | **Contradiction** (D1) |
+| 286–288 | `update()` takes at most `serviceBudgetUs` | Budget checked *after* each transfer; a 256-byte read at 1 MHz can already be ~2 ms | **Can overshoot** |
+| 356 | `SENSOR_STATUS` emitted periodically **and on state change** | Emitted only by `emitStatusIfDue` | **Contradiction** (D8) |
+| 357 | `MANAGER_DIAGNOSTICS` emitted periodically | `writeManagerDiagnostics` never called | **Contradiction** (D7) |
+| 355 | `IMU_SAMPLE` emitted for enabled raw/calibrated reports | No `writeImuSample`; extras are ignored; `get()` returns false | **Not implemented** (D11) |
+| 367 | QUATERNION flags bit1 = first-after-recovery, bit2 = GRV fallback | Encoder sets only bit0 (never, since source is always RV) and bit3; bit1/bit2 never set | **Partly unimplemented** |
+| 415 | `SENSOR_STATUS` offset 8 = `rxPackets` | Encoder writes `reportsDecoded` | **Contradiction** (D8) |
+| 495–506 | JSON debug mode | No `JsonDebugEncoder` | **Not implemented** |
+| 42–48 | `Report` enum values | Values match the current enum | Accurate |
+
+### 8.5 `docs/PLAN.md`
+
+| Line | Statement | Current code | Verdict |
+| --- | --- | --- | --- |
+| 157 | "30 host cases / 168 checks, 0 failures" | Executed 39/185 | **Stale** |
+| 159–162 | Hardware validated stages 1–2 + drain; stages 3+ open | No hardware in this audit | Historical; still the accurate boundary |
+| 203–216 | Deliverable checklist marks HAL, SPI bus manager, SHTP, SH-2, single-sensor example and unit tests as "Planned" | All are implemented | **Outdated status column** |
+| 155 | Compiled example and diagnostic sketch | Not re-run here | Historical |
+| 137–143 | Test strategy says host tests use `g++` | Only MSVC executed; GCC toolchain absent | Historical/toolchain mismatch |
+
+### 8.6 `test/native/README.md`
+
+| Line | Statement | Current registry | Verdict |
+| --- | --- | --- | --- |
+| 36 | SH-2 control covers "product id (4/5 entry forms), … hub rejection, command timeout" | Only the 4-entry product form; no 5-entry test; no hub-rejection test; no command-timeout test (no command is ever pending) | **Overstated** |
+| 34 | SHTP reject includes "unexpected continuation" | Test exists (`shtp_unexpected_continuation`) | Accurate |
+| 34–35 | SHTP continuation/fragmentation coverage | No positive normal-fragment reassembly test; only rejection and oversize | **Incomplete** |
+| 37 | `0xFB`/`0xFA` per-payload delta cases | All four named cases exist | Accurate |
+| 38 | Sensor FSM cases | All named cases exist | Accurate |
+| 61–64 | "every payload the device can produce fits in one transfer, but the channel-0 advertisement … does not" | Self-contradictory: the advertisement is a payload the device produces; the intended statement is "every sensor report payload" | **Wording contradiction** |
+| 58–59 | `build_gcc.sh` not executed (no g++) | No `g++` on `PATH` in this environment | Consistent |
+
+### 8.7 Earlier `output.md` (superseded by this file)
+
+The previous header and metadata were already wrong before this rewrite:
+
+| Old statement | Current fact |
+| --- | --- |
+| "Analysed commit `d040c8e`" | HEAD is `e9a41ec` |
+| "Pass-4 state: working tree on `91e537d`, **not committed**" | Pass 4 is committed as `e9a41ec` |
+| "35 cases / 194 checks" (pass 3) | Current suite is 39/185 |
+| "39 cases / 185 checks (pass 4)" | Correct, but now verified again in this audit |
+| Pass 4 compile/analyze figures | Not re-executed in this audit |
+
+---
+
+## 9. Test registry inventory (actual, at `e9a41ec`)
+
+`test/native/test_main.cpp:828–868` registers exactly **39** cases. The executed suite printed
+`BNO085Multi host tests (39 cases)` and `185 checks, 0 failures`.
+
+| Group | Cases |
+| --- | --- |
+| CRC / frame | `crc16_known_vector`, `encoder_quaternion_frame` |
+| SHTP accept/reject | `shtp_valid_rotation_vector`, `shtp_no_data`, `shtp_zero_length`, `shtp_short_fragment`, `shtp_reserved_length`, `shtp_bad_channel`, `shtp_oversize_transfer`, `shtp_payload_too_large`, `shtp_unexpected_continuation`, `shtp_bus_error`, `shtp_sequence_gap` |
+| SHTP oversize drain | `shtp_oversize_drain_complete`, `shtp_oversize_continuation` |
+| SH-2 control | `sh2_product_id`, `sh2_set_feature_bytes`, `sh2_set_feature_no_ack_wait`, `sh2_late_ack_ignored`, `sh2_reset_complete` |
+| SH-2 reports / timestamps | `sh2_rotation_vector_decode`, `sh2_delay_field`, `sh2_base_timestamp_ref`, `sh2_timestamp_rebase`, `sh2_timestamp_rebase_signed`, `sh2_timestamp_per_payload`, `sh2_timestamp_control_ignored`, `sh2_timestamp_known_example`, `sh2_timestamp_no_reference`, `sh2_timestamp_host_wrap`, `sh2_timestamp_before_zero`, `sh2_duplicate_suppression`, `sh2_report_gap`, `sh2_unknown_report` |
+| Sensor FSM | `sensor_init_sequence`, `sensor_boot_timeout`, `sensor_rejects_grv`, `sensor_survives_malformed`, `sensor_recover_backoff` |
+
+Coverage gaps are listed in §5.2 and §8.6. In particular:
+
+- no positive normal-fragment reassembly test;
+- no 5-entry product-ID test;
+- no `0xF1` hub-rejection test and no command-timeout test (the command slot is no longer
+  armed);
+- no test that an oversize transfer arriving during assembly resets the assembly;
+- no output short-write / `dropped_` test;
+- no test for `Diagnostics` population.
+
+---
+
+## 10. What cannot be claimed from this audit
+
+- **No physical validation.** The board is disconnected and COM11 is unavailable. Product-ID
+  retrieval, set/get feature, Rotation Vector configuration at 100 Hz, report decode on real
+  data, timestamp reconstruction in a real stream, INT latency, the 10-minute soak, the
+  disconnected-INT timeout, 30 cold boots and the Adafruit comparison remain unmeasured.
+- **No ESP32-S3 compile in this pass.** `arduino-cli` is absent from `PATH`. The historical
+  324,174 B / 23,880 B figure is not evidence about the tree today.
+- **No static analysis or sanitizer run in this pass.** MSVC `/analyze` and ASan were not
+  executed; the previous ASan attempt could not link the runtime.
+- **No GCC build.** `g++`, `sh`, `clang++`, `clang-tidy` and `cppcheck` are not on `PATH`.
+- **No hardware proof of the SHTP peek/re-present assumption.** The host tests encode it in
+  the mock; the only hardware evidence is the historical advertisement drain.
+
+---
+
+## 11. Recommended next work (ordered)
+
+1. **Correct the documentation rows that are now factually wrong** (no code change):
+   - `README.md:137` (fragments are reassembled);
+   - `docs/PHASE1-NOTES.md:27–28` (timestamp formula and fragment assembly) and
+     `:121,137–139` (stale compile figure and 12 ms open item);
+   - `docs/PLAN.md:157` and the deliverable statuses at `:203–216`;
+   - `test/native/README.md:36,61–64`.
+2. **Add the missing positive host tests** before touching SHTP again: a two-fragment normal
+   reassembly case, an oversize-during-assembly case, and a short-write/`dropped_` case.
+3. **Decide D1 (INT):** implement the documented ISR + pending mask, or amend
+   `README`/`API`/`ARCHITECTURE` to state "poll-observation time" consistently.
+4. **Decide D2/D3 (recovery):** wire faults into `recover()` with the existing backoff, and
+   reset the attempt counter in `recover()`, or document that Phase 1 recovery is
+   application-driven.
+5. **Decide D4/D5/D6/D7/D8 (output/diagnostics):** attach a null sink instead of `nullptr`,
+   surface `framesDropped()`, emit one rate-limited `OutputOverflow`, populate
+   `Diagnostics::product`, and align `SENSOR_STATUS` with `API.md` (or amend the API).
+6. **Re-run evidence after any change:** host tests, ESP32-S3 compile, and (if available)
+   static analysis. Do not mark stages 3+ physically tested until the board is reconnected
+   and the procedure in the old §14.8 (now superseded) is actually performed.
+
+---
+
+## 12. Working-tree state after this audit
+
+This audit changed **only** `output.md`. No source, test, build script, example or other
+document was modified, staged, committed or pushed. `build/` output is git-ignored.
+
+The final `git status` / `git diff --stat` are reproduced in the chat response that
+accompanies this file; at the time of writing the only expected change is:
+
+```
+modified: output.md
+```
