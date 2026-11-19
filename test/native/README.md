@@ -33,8 +33,8 @@ is what the hardware bring-up checklist is for.
 | SHTP accept | valid rotation-vector transfer, reception timestamp propagation, sequence gap counting |
 | SHTP reject | no data, zero length, short fragment, reserved length, bad channel, oversize transfer, payload larger than payload buffer, unexpected continuation, bus error |
 | SHTP oversize drain | 552-byte advertisement consumed completely (nothing stranded, device idle afterwards), oversized continuation chain drained fragment by fragment, report arriving right after an oversize still decodes |
-| SH-2 control | product id (4/5 entry forms), set-feature byte layout, hub rejection, command timeout, reset-complete |
-| SH-2 reports | RV decode (Q14 + accuracy), delay ticks and timestamp reconstruction, duplicate suppression, report gaps, unknown report id |
+| SH-2 control | product id (4/5 entry forms), set-feature complete 21-byte frame and second-frame sequence, hub rejection, command timeout, reset-complete |
+| SH-2 reports | RV decode (Q14 + accuracy), delay ticks and timestamp reconstruction, `0xFB`/`0xFA` per-payload delta (known example, zero fallback, host-counter wrap, negative-result low 32 bits), duplicate suppression, report gaps, unknown report id |
 | Sensor FSM | full boot → identify → configure → get-feature → streaming, boot timeout, unsupported report rejection, recovery from a malformed transfer, recovery backoff |
 
 ## Running

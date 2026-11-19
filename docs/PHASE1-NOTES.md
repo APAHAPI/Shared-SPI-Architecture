@@ -30,6 +30,12 @@ GRV configuration is rejected with `UnsupportedReport`).
 | 7 | `Sensor::get()` delivers records | Returns `false` in Phase 1 | Records are delivered through the callback and the output sink; the manager queue that backs `get()` is Phase 2 |
 | 8 | Advertisement is ~276 B (implied by the channel math) | 552 B on the tested part | Measured on hardware. `MAX_PAYLOAD_IN`-style assumptions in the upstream docs are 4 × 68 B entries; this firmware sends twice that. Any buffer sizing based on 276 B would fail at the first packet of every cold boot |
 
+> **Superseded (2026-11-18).** Deviation 4 and the host-test count below describe the
+> Phase 1 delivery. Pass 3 corrected the timestamp IDs/channel handling; pass 4 made
+> the per-payload fallback reference-exact (0 ticks, no negative clamp). Current
+> behaviour is in `output.md` §14 and `README.md`. The suite is now 39 cases /
+> 185 checks.
+
 ## Evidence
 
 **Measured on hardware** (ESP32-S3, Adafruit BNO085, COM11 = CH343 UART bridge,
@@ -46,9 +52,10 @@ SPI mode 3 at 1 MHz, pins 12/11/13/10/9/8):
 | Transport drain of the 552 B advertisement | one `Oversize` result, 4 bus transactions (peek + 256 + 256 + 40), device idle afterwards, 0 bad fragments, 0 short fragments, 0 rx errors |
 | Timestamps drift / cold boots | not measured (stages 3–8 not started) |
 
-**Host tests:** 168 checks across 30 cases, 0 failures, via
+**Host tests at Phase 1 delivery:** 168 checks across 30 cases, 0 failures, via
 `test\native\build_msvc.bat` (MSVC 2022). See `test/native/README.md` for what each
-case covers and for the simulated-versus-real distinction.
+case covers and for the simulated-versus-real distinction. (Current count: 39 cases /
+185 checks; see `output.md` §14.)
 
 ## Transport fix: oversized transfer drain (validated on hardware)
 

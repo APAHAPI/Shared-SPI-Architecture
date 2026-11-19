@@ -6,11 +6,12 @@
 namespace bno085 {
 
 namespace {
-// Datasheet 1000-3927 section 1.3.5: the host timestamps at H_INTN assertion and
-// each report adds its own delay in 100 us units. Input payloads carry their own
-// timebase delta (0xFB reference, 0xFA rebase); until a 0xFB arrives, retain the
-// Phase-1 fallback of assuming the documented 12 ms reference.
-constexpr int64_t kDefaultReferenceDeltaTicks = -120;
+// Reference sh2.c sensorhubInputHdlr(): referenceDelta starts at 0 for each
+// input payload. A 0xFB base timestamp reference replaces it with -timebase;
+// a 0xFA rebase adds a signed delta. The host timestamps at H_INTN assertion
+// and each report adds its own delay in 100 us units (datasheet 1000-3927
+// section 1.3.5).
+constexpr int64_t kDefaultReferenceDeltaTicks = 0;
 constexpr int32_t kTimestampTickUs = 100;
 constexpr float kQ14Scale = 1.0f / 16384.0f;
 } // namespace
@@ -375,10 +376,11 @@ void Sh2Client::handleRotationVector(const uint8_t* report, uint8_t length,
 
 uint32_t Sh2Client::computeMeasTime(uint32_t tEdgeUs, uint16_t delayTicks,
                                     int64_t referenceDeltaTicks) const {
-  // Reference sh2.c touSTimestamp(): (referenceDelta + delay) * 100 us.
-  int64_t t = static_cast<int64_t>(tEdgeUs) +
-              (referenceDeltaTicks + delayTicks) * kTimestampTickUs;
-  if (t < 0) t = 0;
+  // Reference sh2.c touSTimestamp(): hostInt + (referenceDelta + delay) * 100.
+  // The reference keeps a 64-bit timestamp; this record carries the low 32 bits,
+  // so the result wraps with the host micros() counter.
+  const int64_t t = static_cast<int64_t>(tEdgeUs) +
+                    (referenceDeltaTicks + delayTicks) * kTimestampTickUs;
   return static_cast<uint32_t>(t);
 }
 

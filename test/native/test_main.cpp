@@ -456,33 +456,29 @@ void testSh2SetFeatureBytes() {
   CHECK(fx.hal.sent.size() == 1);
 
   const std::vector<uint8_t>& frame = fx.hal.sent.back();
-  CHECK(frame.size() == 21);
-  CHECK(frame[0] == 0x15);  // length 21
-  CHECK(frame[1] == 0x00);
-  CHECK(frame[2] == 0x02);  // SH-2 control channel
-  CHECK(frame[3] == 0x00);  // SHTP sequence
-  CHECK(frame[4] == 0xFD);  // set feature
-  CHECK(frame[5] == 0x05);  // featureReportId (was a command counter)
-  CHECK(frame[6] == 0x00);  // flags
-  CHECK(frame[9] == 0x60);  // 60000 = 0x0000EA60
-  CHECK(frame[10] == 0xEA);
-  CHECK(frame[11] == 0x00);
-  CHECK(frame[12] == 0x00);
-  CHECK(frame[17] == 0x00);  // sensorSpecific
-  CHECK(frame[18] == 0x00);
-  CHECK(frame[19] == 0x00);
-  CHECK(frame[20] == 0x00);
+  const std::vector<uint8_t> expected = {
+      0x15, 0x00, 0x02, 0x00,  // SHTP: 21-byte transfer, control channel, seq 0
+      0xFD,                    // SENSORHUB_SET_FEATURE_CMD
+      0x05,                    // featureReportId = Rotation Vector
+      0x00,                    // flags
+      0x00, 0x00,              // changeSensitivity (u16)
+      0x60, 0xEA, 0x00, 0x00,  // reportInterval_uS = 60000 (LE)
+      0x00, 0x00, 0x00, 0x00,  // batchInterval_uS
+      0x00, 0x00, 0x00, 0x00}; // sensorSpecific
+  CHECK(frame == expected);
 
   // Reference behaviour: completion is send success, not a 0xF1 response.
   CHECK(fx.sh2.cmdState() == bno085::Sh2Client::CmdState::Ok);
   CHECK(!fx.sh2.busy());
 
-  // A second request must not alter byte 1.
+  // A second request must not alter byte 1 and must start at the next SHTP seq.
   CHECK(fx.sh2.setFeature(0x05, 10000, 2000));
   CHECK(fx.hal.sent.size() == 2);
-  CHECK(fx.hal.sent.back()[5] == 0x05);
-  CHECK(fx.hal.sent.back()[9] == 0x10);  // 10000 = 0x00002710
-  CHECK(fx.hal.sent.back()[10] == 0x27);
+  std::vector<uint8_t> expectedSecond = expected;
+  expectedSecond[3] = 0x01;  // SHTP sequence
+  expectedSecond[9] = 0x10;  // 10000 = 0x00002710
+  expectedSecond[10] = 0x27;
+  CHECK(fx.hal.sent.back() == expectedSecond);
 }
 
 void testSh2RotationVectorDecode() {
@@ -506,7 +502,7 @@ void testSh2RotationVectorDecode() {
   CHECK(q.rawAccuracy == 0x0080);
   CHECK(q.seq == 42);
   CHECK(q.tHostUs == 100000);
-  CHECK(q.tMeasUs == 88000);  // 100000 - 12000 reference, no delay
+  CHECK(q.tMeasUs == 100000);  // no base reference: delta starts at 0
   CHECK(q.source == bno085::Report::RotationVector);
 }
 
@@ -517,7 +513,7 @@ void testSh2DelayField() {
   fx.sh2.handlePayload(3, report.data(), static_cast<uint16_t>(report.size()), 100000);
   CHECK(fx.quaternionCalls == 1);
   CHECK(fx.lastQuaternion.delayTicks == 300);
-  CHECK(fx.lastQuaternion.tMeasUs == 118000);  // 100000 - 12000 + 30000
+  CHECK(fx.lastQuaternion.tMeasUs == 130000);  // 100000 + 300*100
   CHECK(fx.lastQuaternion.accuracy == bno085::Accuracy::Unreliable);
 }
 
@@ -581,12 +577,13 @@ void testSh2TimestampDeltaIsPerPayload() {
                        static_cast<uint16_t>(firstPayload.size()), 100000);
   CHECK(fx.lastQuaternion.tMeasUs == 80000);
 
-  // No reference in the next payload: fall back to the documented 12 ms default.
+  // No reference in the next payload: the delta starts at 0, as in the
+  // reference implementation; it must not inherit the previous payload's delta.
   const std::vector<uint8_t> secondReport =
       makeRotationVector(2, 0, 0, 0, 16384, 3, 0, 0);
   fx.sh2.handlePayload(3, secondReport.data(),
                        static_cast<uint16_t>(secondReport.size()), 200000);
-  CHECK(fx.lastQuaternion.tMeasUs == 188000);  // 200000 - 12000
+  CHECK(fx.lastQuaternion.tMeasUs == 200000);
 }
 
 void testSh2TimestampOnControlChannelIgnored() {
@@ -597,9 +594,60 @@ void testSh2TimestampOnControlChannelIgnored() {
   const std::vector<uint8_t> rv =
       makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
   fx.sh2.handlePayload(3, rv.data(), static_cast<uint16_t>(rv.size()), 100000);
-  CHECK(fx.lastQuaternion.tMeasUs == 88000);  // unchanged 12 ms fallback
+  CHECK(fx.lastQuaternion.tMeasUs == 100000);  // control-channel 0xFB had no effect
   CHECK(fx.sh2.stats().baseTimestampRefs == 0);
   CHECK(fx.sh2.epoch() == 0);
+}
+
+void testSh2TimestampKnownExample() {
+  Sh2Fixture fx;
+  std::vector<uint8_t> payload = makeTimestampReport(0xFB, 120);
+  const std::vector<uint8_t> rv =
+      makeRotationVector(7, 0, 0, 0, 16384, 3, 150, 0);
+  payload.insert(payload.end(), rv.begin(), rv.end());
+
+  fx.sh2.handlePayload(3, payload.data(), static_cast<uint16_t>(payload.size()),
+                       1000000);
+  CHECK(fx.quaternionCalls == 1);
+  // tMeas = 1,000,000 + (-120 + 150) * 100 = 1,003,000 us.
+  CHECK(fx.lastQuaternion.tMeasUs == 1003000);
+}
+
+void testSh2TimestampNoReferenceStartsAtZero() {
+  Sh2Fixture fx;
+  const std::vector<uint8_t> rv =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  fx.sh2.handlePayload(3, rv.data(), static_cast<uint16_t>(rv.size()), 123456);
+  CHECK(fx.quaternionCalls == 1);
+  // The reference initialises referenceDelta to 0, not to a 12 ms guess.
+  CHECK(fx.lastQuaternion.tMeasUs == 123456);
+}
+
+void testSh2TimestampWrapsWithHostCounter() {
+  Sh2Fixture fx;
+  const std::vector<uint8_t> rv =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 10, 0);
+  fx.sh2.handlePayload(3, rv.data(), static_cast<uint16_t>(rv.size()),
+                       0xFFFFFF00u);
+  CHECK(fx.quaternionCalls == 1);
+  // 0xFFFFFF00 + 10*100 = 0xFFFFFF00 + 0x3E8 = 0x1000002E8; the low 32 bits
+  // are 0x2E8 = 744. The reference keeps a 64-bit value, but this record field
+  // is 32 bit and wraps with the host micros() counter.
+  CHECK(fx.lastQuaternion.tMeasUs == 744u);
+}
+
+void testSh2TimestampBeforeZeroWraps() {
+  Sh2Fixture fx;
+  std::vector<uint8_t> payload = makeTimestampReport(0xFB, 200);
+  const std::vector<uint8_t> rv =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  payload.insert(payload.end(), rv.begin(), rv.end());
+
+  fx.sh2.handlePayload(3, payload.data(), static_cast<uint16_t>(payload.size()),
+                       1000);
+  CHECK(fx.quaternionCalls == 1);
+  // 1000 - 200*100 = -19000; the record carries the low 32 bits.
+  CHECK(fx.lastQuaternion.tMeasUs == 0xFFFFB5C8u);
 }
 
 void testSh2DuplicateSuppression() {
@@ -807,6 +855,10 @@ int main() {
       {"sh2_timestamp_rebase_signed", testSh2TimestampRebaseSigned},
       {"sh2_timestamp_per_payload", testSh2TimestampDeltaIsPerPayload},
       {"sh2_timestamp_control_ignored", testSh2TimestampOnControlChannelIgnored},
+      {"sh2_timestamp_known_example", testSh2TimestampKnownExample},
+      {"sh2_timestamp_no_reference", testSh2TimestampNoReferenceStartsAtZero},
+      {"sh2_timestamp_host_wrap", testSh2TimestampWrapsWithHostCounter},
+      {"sh2_timestamp_before_zero", testSh2TimestampBeforeZeroWraps},
       {"sh2_reset_complete", testSh2ResetComplete},
       {"sensor_init_sequence", testSensorInitializationSequence},
       {"sensor_boot_timeout", testSensorBootTimeout},

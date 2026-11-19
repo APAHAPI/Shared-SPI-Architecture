@@ -5,14 +5,17 @@ repository actually does, traced from `setup()` through to a decoded Rotation Ve
 binary output, and lists every place where the implementation differs from the documents in
 `docs/`.
 
-The file has been through three passes. Pass 1 (§0–§11) traced the implementation and listed
+The file has been through four passes. Pass 1 (§0–§11) traced the implementation and listed
 documentation divergences; it changed no source. Pass 2 (§12) re-derived the five highest-priority
 findings from the source and the reference **without relying on pass 1**, corrected two statements,
 and added per-finding verdicts. Pass 3 (§13) implemented the two highest-priority protocol
 corrections — set-feature payload/completion and timestamp reference/rebase — added regression
-tests, re-ran the host suite and the ESP32-S3 compile, and committed the result. Where an earlier
-section still describes the pre-fix behaviour, that section's pass-3 status note and **§13** are
-authoritative.
+tests, re-ran the host suite and the ESP32-S3 compile, and committed the result. Pass 4 (§14)
+re-verified both protocol areas against the reference, corrected the remaining timestamp
+fallback/clamp divergence, strengthened the set-feature test to a full golden frame, added four
+timestamp regression cases, and re-ran the host suite, the ESP32-S3 compile and MSVC static
+analysis. Pass 4 is **uncommitted**; see §14.7. Where an earlier section still describes pre-fix
+behaviour, that section's status note and **§13/§14** are authoritative.
 
 | Item | Value |
 | --- | --- |
@@ -20,9 +23,10 @@ authoritative.
 | Library name / version | `BNO085Multi` 0.1.0 (`library.properties`) |
 | Analysed commit | `d040c8e` — "Drain oversized SHTP transfers completely" (`git log --oneline`) |
 | Pass-2 document commit | `5ce28fe` — "Update output.md"; `src/` unchanged since `d040c8e` |
-| Pass-3 code/test commit | recorded in §13.6 (set-feature + timestamp fixes) |
+| Pass-3 code/test commit | `25deebf` — "Fix SH-2 set-feature payload and timestamp reconstruction" |
+| Pass-4 state | Working tree on `91e537d`, **not committed** (§14) |
 | Stage | Phase 1 — single-sensor baseline, ESP32-S3, Arduino core 3.3.12 |
-| Analysis date | 2026-11-17 |
+| Analysis date | 2026-11-17 (passes 1–3); 2026-11-18 (pass 4) |
 | Authoritative sources for this file | The source files themselves. Protocol comparisons were checked against the Hillcrest/CEVA reference `sh2.c`, downloaded for pass 2 to `%TEMP%\sh2_ref.c` (Adafruit mirror; the same upstream that `docs/UPSTREAM-AUDIT.md` analyses). |
 | Files read | `README.md`; `docs/{ARCHITECTURE,API,PHASE1-NOTES,UPSTREAM-AUDIT}.md`; `src/BNO085Multi.h`, `BNO085Config.h`, `BNO085Types.{h,cpp}`, `BNO085Sensor.{h,cpp}`; `src/hal/{IHal.h,SpibusManager.*,Esp32SpiHal.*}`; `src/shtp/{ShtpProtocol.h,ShtpTransport.*}`; `src/sh2/{Sh2Codes.*,Sh2Client.*,Sh2Reports.*}`; `src/output/{OutputProtocol.h,IOutputSink.h,BinaryEncoder.*,ArduinoSink.h}`; `src/util/Crc16.*`; `src/diag/Logger.h`; `examples/01_SingleSensor/01_SingleSensor.ino`; `test/native/{test_main.cpp,mock_hal.h}` |
 
@@ -600,6 +604,10 @@ decoder"), `extras/host/bno085_stream.py`, `examples/02`/`03`, `BNO085Manager.*`
   magnitude of base timestamps, and actual INT-to-poll latency remain unmeasured; see §12.9.
 - Pass 3 implemented P1–P3 from §12.7 and re-ran the host suite and ESP32-S3 compile (above). It
   added **no** hardware evidence either; the same three questions remain open.
+- **Pass 4 (2026-11-18)** re-ran both checks after the §14 changes: **39 cases / 185 checks, 0
+  failures** and **324 174 B** flash (24 %), 23 880 B RAM (7 %), 0 warnings/errors. MSVC
+  `/analyze` was clean; MSVC AddressSanitizer could not be linked because the runtime library is
+  not installed. Still no hardware evidence.
 
 ---
 
@@ -956,8 +964,9 @@ observability. Each step is independently testable.
 | Service budget / max transfers | 2 000 µs / 3 | `ManagerConfig` |
 | Silence limit | `(interval × 5)/2 + 50 ms` | `BNO085Sensor.cpp:332–333` |
 | `tMeas` | `tEdge + (referenceDelta + delayTicks) × 100` | `Sh2Client.cpp:13–14, 376–382` |
-| `kDefaultReferenceDeltaTicks` | −120 ticks (−12 000 µs); fallback until a `0xFB` arrives | `Sh2Client.cpp:13` |
-| `kTimestampTickUs` | 100 µs per tick | `Sh2Client.cpp:14` |
+| `kDefaultReferenceDeltaTicks` | 0 ticks; per-payload starting delta before any `0xFB` | `Sh2Client.cpp:14` |
+| `kTimestampTickUs` | 100 µs per tick | `Sh2Client.cpp:15` |
+| `tMeas` width | low 32 bits of the 64-bit reference formula; wraps with `micros()` | `Sh2Client.cpp:377–384` |
 | Reference base timestamp | `0xFB`, u32, `referenceDelta = -timebase` | `sh2.c:293–298, 563–567` |
 | Reference timestamp rebase | `0xFA`, i32, `referenceDelta += timebase` | `sh2.c:299–303, 569–572` |
 
@@ -967,8 +976,8 @@ observability. Each step is independently testable.
 | --- | --- | --- | --- |
 | Set-feature payload | `Sh2Client.cpp:399–429` | 17 bytes, byte 1 = feature ID | **done (pass 3):** byte 1 = `reportId` |
 | Set-feature completion | `BNO085Sensor.cpp:258–281` | completes on `sendCtrl`, no `.rx` | **done (pass 3):** completes on send; stray ack ignored |
-| Base timestamp | `Sh2Client.cpp:266–275` inside `handleReports` | input payload, `0xFB`, u32, negated | **done (pass 3):** per-payload delta |
-| Timestamp rebase | `Sh2Client.cpp:276–286` inside `handleReports` | input payload, `0xFA`, i32, accumulated | **done (pass 3):** per-payload, `epoch_` here |
+| Base timestamp | `Sh2Client.cpp:266–275` inside `handleReports` | input payload, `0xFB`, u32, negated | **done (pass 3); fallback/clamp made reference-exact in pass 4 (§14.2)** |
+| Timestamp rebase | `Sh2Client.cpp:276–286` inside `handleReports` | input payload, `0xFA`, i32, accumulated | **done (pass 3); reference-exact fallback in pass 4 (§14.2)** |
 | INT capture | `BNO085Sensor.cpp:165–171` | ISR edge per docs | `tHostUs` is poll time today (**open**) |
 | Recovery entry | `BNO085Sensor.cpp:369` (manual only) | fault → Recovering | `Failed` is terminal today (**open**) |
 | Output loss | `BinaryEncoder.cpp:53–61` | caller decides | returns are ignored today (**open**) |
@@ -1079,9 +1088,10 @@ the build.
   (a) whether this hub acknowledges `0xFD`, (b) the magnitude of real `0xFB` timebases,
   (c) actual INT-to-poll latency. The fixes remove a protocol divergence; they do not prove the
   sensor streams.
-- **Fallback delta.** A payload that arrives before any `0xFB` uses `-120` ticks (−12 ms), retained
-  from Phase 1 to preserve prior behaviour. The reference starts at 0, so this is an approximation,
-  not protocol-exact. It affects only the start of a stream (or a payload with no reference).
+- **Fallback delta (superseded by pass 4, §14.2).** A payload that arrives before any `0xFB` used
+  `-120` ticks (−12 ms), retained from Phase 1 to preserve prior behaviour. The reference starts at
+  0, so this was an approximation, not protocol-exact. Pass 4 changed the fallback to 0 and removed
+  the separate negative clamp.
 - **Timestamp statistics.** `stats_.baseTimestampRefs` counts every `0xFB` report; no separate
   rebase counter exists. This is observability, not correctness.
 - **Dormant bookkeeping.** `cmdId_`, `cmdSeq_`, `cmdDeadlineUs_`, and the `StageSetFeature`
@@ -1102,3 +1112,203 @@ the build.
 
 **Commit.** `25deebf` — "Fix SH-2 set-feature payload and timestamp reconstruction". It contains the
 four source/test files above; the following commit records this document.
+
+---
+
+## 14. Pass 4 — independent re-verification (2026-11-18, uncommitted)
+
+### 14.0 Baseline and scope
+
+| Item | Value |
+| --- | --- |
+| Branch / HEAD | `main` / `91e537d` ("Add verification Q&A summary to output.md") |
+| Working tree at start | clean; `origin/main` matched `91e537d` |
+| Changes since audited commit `d040c8e` | `25deebf` (P1–P3 code/tests), `5b0034f` + `91e537d` (documentation), plus this pass |
+| Hardware | ESP32-S3 and BNO085 **disconnected**; COM11 unavailable. No hardware action attempted |
+| Scope | Re-verify SH-2 set-feature and timestamp reference/rebase; fix only understood, host-testable defects. No Phase 2, no `Manager` |
+
+Both protocol areas were re-read from the current source and compared with the same authoritative
+Hillcrest/CEVA `sh2.c` snapshot (`%TEMP%\sh2_ref.c`) used in pass 2. The previous pass's conclusions
+were **not** assumed; each was re-derived.
+
+### 14.1 SH-2 set feature — verified, no source change
+
+The implementation at `91e537d` already matches the reference. Re-confirmed item by item:
+
+| Field (payload offset) | Reference type | Code at HEAD | Verdict |
+| --- | --- | --- | --- |
+| `reportId` (0) | `0xFD` | `0xFD` | correct |
+| `featureReportId` (1) | sensor id | `reportId` argument (`0x05`) | correct |
+| `flags` (2) | `uint8_t` | `0x00` (no flags) | correct |
+| `changeSensitivity` (3–4) | `uint16_t` LE | 0 | correct |
+| `reportInterval_uS` (5–8) | `uint32_t` LE | interval argument LE | correct |
+| `batchInterval_uS` (9–12) | `uint32_t` LE | 0 | correct |
+| `sensorSpecific` (13–16) | `uint32_t` LE | 0 (RV has no options) | correct |
+
+- **No command sequence field exists** in `SetFeatureReport_t`; byte 1 is the feature ID. The code
+  no longer writes a counter there, and its only sequence is the SHTP per-channel sequence.
+- **Completion:** reference `setSensorConfigStart` calls `sendCtrl` then `opCompleted` immediately;
+  `setSensorConfigOp` has no `.rx`. The code completes on a successful send, arms no ack deadline,
+  and a stray `0xF1` is counted as unsolicited. Correct.
+- **Channel/framing:** control channel 2, SHTP header length `21`, total transfer 21 bytes. The test
+  now compares the **entire** 21-byte frame, so any future offset, endianness, sequence or padding
+  regression fails.
+
+No source change was needed. The existing test was strengthened rather than duplicated.
+
+### 14.2 Timestamp reference/rebase — one remaining divergence fixed
+
+**Verified correct at HEAD:** IDs `0xFB` (base reference, `uint32_t`) and `0xFA` (rebase,
+`int32_t`); both are input-report IDs handled inside `handleReports` (channels 3/4), not the
+control channel; field offset 1, length 4, little-endian; 100 µs units; `0xFB` **assigns**
+`referenceDelta = -timebase`; `0xFA` **accumulates** the sign-extended value; the delta is local
+to the payload being parsed; `epoch_` increments on `0xFA` only.
+
+**Confirmed defect (fallback/clamp).** `computeMeasTime` had:
+
+```cpp
+constexpr int64_t kDefaultReferenceDeltaTicks = -120;
+...
+int64_t t = tEdgeUs + (referenceDeltaTicks + delayTicks) * 100;
+if (t < 0) t = 0;               // invented guard
+```
+
+The reference initialises `referenceDelta = 0` for every payload (`sensorhubInputHdlr` line 549),
+so `-120` was a Phase-1 approximation, not the protocol formula. The `t < 0 → 0` clamp also has no
+counterpart in the reference, which accumulates into a `uint64_t`.
+
+**Derivation of the correct result.** The reference computes
+
+```
+timestamp = (rollovers << 32) + hostInt + (referenceDelta + delay) * 100
+```
+
+where the arithmetic before the 64-bit accumulation is unsigned 32-bit in C. The exported
+`Quaternion::tMeasUs` is 32 bits, i.e. the low 32 bits of that value. Therefore:
+
+```
+tMeasUs = (uint32_t)(tEdgeUs + (referenceDeltaTicks + delayTicks) * 100)
+```
+
+with `referenceDeltaTicks` starting at 0 and changed only by `0xFB`/`0xFA` in the same payload.
+No clamp. This wraps exactly like the host `micros()` counter.
+
+**Fix** (`src/sh2/Sh2Client.cpp`): `kDefaultReferenceDeltaTicks = 0`; `computeMeasTime` returns
+`static_cast<uint32_t>(t)` without the clamp; comments now cite the reference formula and the
+32-bit truncation. No other timestamp behaviour changed.
+
+**Worked examples used as tests**
+
+| Input | Expected `tMeasUs` | Why |
+| --- | --- | --- |
+| `0xFB` timebase 120, delay 150, `tEdge` 1 000 000 | 1 003 000 | `1 000 000 + (−120 + 150) × 100` |
+| no `0xFB`, delay 0, `tEdge` 123 456 | 123 456 | fallback delta is 0 |
+| no `0xFB`, delay 10, `tEdge` `0xFFFFFF00` | 744 (`0x2E8`) | `0xFFFFFF00 + 0x3E8` truncated to 32 bits |
+| `0xFB` timebase 200, delay 0, `tEdge` 1000 | `0xFFFFB5C8` | `1000 − 20 000`, low 32 bits |
+
+### 14.3 Other areas inspected
+
+Re-read without changing: SHTP framing/sequence/oversize drain (`ShtpTransport.cpp`), SPI lock and
+CS release (`SpiBusManager.cpp`, `Esp32SpiHal.cpp`), bounded waits and INT polling
+(`BNO085Sensor.cpp`), per-sensor state isolation, recovery/backoff, RV/Q14 decode
+(`Sh2Reports.cpp`), CRC-16/CCITT-FALSE (`Crc16.cpp`), output short-write handling
+(`BinaryEncoder.cpp`) and buffer sizes (`BNO085Config.h`). No new defect was found that was both
+certain and safely fixable without hardware.
+
+**Rejected / uncertain findings**
+
+- Set-feature ack behaviour of real hub firmware remains **unproven**; the reference divergence is
+  resolved, but the device has never been observed.
+- `recover()` attempt-counter reset (P5) and silent output loss (P6) are confirmed design gaps from
+  §12.4–§12.6, but fixing them changes recovery/observability policy beyond this pass. Left open.
+- INT polling vs documented ISR (P4) is a documentation/code mismatch, not a protocol error. Left
+  open deliberately.
+- The example prints `tHostUs - tMeasUs` as an unsigned latency. With the corrected fallback this
+  can underflow when `delay > 0` and no `0xFB` is present. It is a diagnostic display issue only;
+  flagged for review, not changed (see §14.7).
+
+### 14.4 Regression tests
+
+`test/native/test_main.cpp`:
+
+- `sh2_set_feature_bytes` now compares the complete first frame:
+  `15 00 02 00 FD 05 00 00 00 60 EA 00 00 00 00 00 00 00 00 00 00`, and a second call is compared
+  against the same frame with SHTP sequence `01` and interval `10 27 00 00`. This covers every
+  payload byte and both completions.
+- New `sh2_timestamp_known_example`: `0xFB` + delay in one payload → 1 003 000 µs.
+- New `sh2_timestamp_no_reference`: no reference → delta 0 → `tEdge` unchanged.
+- New `sh2_timestamp_host_wrap`: host-counter wrap → low 32 bits (744).
+- New `sh2_timestamp_before_zero`: negative result → two's-complement low 32 bits.
+- Existing expectations were re-baselined from the old −120 fallback: `sh2_rotation_vector_decode`
+  now expects 100 000 instead of 88 000; the delay-field case 130 000 instead of 118 000; the
+  per-payload case 200 000 instead of 188 000; the control-channel case 100 000 instead of 88 000.
+
+The suite is **39 cases / 185 checks**. It covers the init FSM, timeouts, malformed/oversized
+transfers, recovery backoff, CRC, framing, decode and the two protocol areas.
+
+### 14.5 Exact evidence
+
+| Check | Exact command | Exit | Result |
+| --- | --- | --- | --- |
+| Native host tests | `cmd /c "test\native\build_msvc.bat"` | 0 | **39 cases, 185 checks, 0 failures, `RESULT: PASS`** (`build\native_tests.log`) |
+| ESP32-S3 compile | `arduino-cli compile --fqbn esp32:esp32:esp32s3 --build-path build\esp32s3_verify --library . --clean --warnings all --verbose examples\01_SingleSensor` | 0 | **324 174 B flash (24 %)**, **23 880 B RAM (7 %)**, 0 warnings, 0 errors (`build\esp32s3_verify.log`) |
+| MSVC static analysis | `cmd /c "build\analyze_msvc.bat"` (`cl /analyze` over all core `.cpp`) | 0 | no diagnostics (`build\msvc_analyze.log`) |
+| MSVC AddressSanitizer | `cmd /c "build\asan_msvc.bat"` | 1 | **not run**: `LNK1104: cannot open file 'clang_rt.asan_static_runtime_thunk-x86_64.lib'` — ASan runtime not installed (`build\msvc_asan.log`) |
+| GCC host build | `sh test/native/build_gcc.sh` | — | **not run**: no `sh`, `g++`, `clang++`, `clang-tidy` or `cppcheck` in this environment |
+
+The ESP32-S3 image is 36 B smaller than pass 3 (324 210 B), consistent with removing the clamp
+branch. RAM is unchanged. `build\analyze_msvc.bat` and `build\asan_msvc.bat` are local helper
+scripts under the ignored `build/` directory; they are not part of the library.
+
+### 14.6 Remaining limitations
+
+- **No hardware evidence.** Product-ID retrieval, set/get feature, Rotation Vector streaming,
+  timestamp reconstruction in a real stream, INT latency and soak/cold-boot behaviour remain
+  unmeasured. This pass changes software only.
+- **P4 (INT polling)** — `tHostUs` is poll-observation time; README/API/ARCHITECTURE describe
+  INT-assertion time. Open.
+- **P5 (recovery)** — no fault-triggered `recover()`; the attempt budget is not reset inside
+  `recover()`. Open.
+- **P6 (output loss)** — short writes are not surfaced and `dropped_` is not a true loss counter.
+  Open.
+- **Timestamp observability** — only `stats_.baseTimestampRefs` exists; there is no rebase counter.
+- **Example diagnostic** — `tHostUs - tMeasUs` can underflow as an unsigned value in the text
+  example (see §14.7); it does not affect the binary record, which carries both timestamps.
+- **Set-feature ack** — the reference treatment is implemented, but whether this hub emits `0xF1`
+  for `0xFD` cannot be known without hardware.
+
+### 14.7 Files changed and review notes (uncommitted)
+
+| File | Change | Review sensitivity |
+| --- | --- | --- |
+| `src/sh2/Sh2Client.cpp` | fallback delta `-120 → 0`; removed `t < 0` clamp; comment now cites `touSTimestamp` and 32-bit truncation | **Review:** this intentionally changes `tMeasUs` for payloads without a `0xFB` and for negative results. It is reference-exact, but it changes the observable value relative to pass 3 |
+| `test/native/test_main.cpp` | full golden 21-byte set-feature frame + second frame; four new timestamp cases; four re-baselined expectations; registry entries | Review test expectations against §14.2 |
+| `output.md` | this §14, pass-4 status notes, Appendix B constant | Documentation only |
+| `README.md` | host-test count, build size, timestamp formula | Check wording matches §14.2 |
+| `test/native/README.md` | coverage row mentions reference-exact timestamp cases | Documentation only |
+
+Nothing was staged, committed, amended, rebased or pushed. `git status` also shows the ignored
+`build/` outputs; those are not source changes.
+
+**Needs user review:** (1) the fallback/clamp semantics in `Sh2Client.cpp`; (2) whether to keep the
+32-bit truncation or widen `Quaternion::tMeasUs` (a wire-format change, deliberately not done);
+(3) the example's unsigned `dt` display; (4) whether P4–P6 should be scheduled next.
+
+### 14.8 Hardware validation procedure (when the board is reconnected)
+
+1. Wire per the baseline (SCK 12, MOSI 11, MISO 13, CS 10, INT 9, RST 8; PS0/PS1 high), common
+   ground, 3.3 V, SPI mode 3 at 1 MHz.
+2. Flash `examples/01_SingleSensor` with `BNO085_BINARY_OUTPUT 0`; open serial at 115 200 baud.
+3. Expect `BNO085Multi phase-1 baseline started`, the channel-0 advertisement drained on boot, and
+   eventually `[Streaming]`. Press `d`: record product ID, firmware version, `granted=10000us`,
+   packet/error counters.
+4. Confirm Rotation Vector lines arrive at ≈100 Hz; press `q` and check a unit-norm quaternion and
+   accuracy. Record `tMeas` and `dt` for at least 100 reports.
+5. Timestamp check: compare consecutive `tMeas` deltas with the configured 10 ms interval. Confirm
+   `tMeas` stays monotonic modulo 32-bit wrap and that `tHostUs` is close to `micros()` at
+   reception. If a `0xFB` is visible in logs, verify the delta maps device time to host time.
+6. Fault checks: temporarily disconnect INT → expect `Degraded` + one `ERROR`, then reconnect;
+   press `r` to exercise recovery and confirm the attempt/backoff path. Power-cycle 10 times and
+   record whether every boot reaches `Streaming`.
+7. Only then mark stages 3+ as physically tested. Record actual values; do not reuse the host-test
+   expectations as hardware evidence.

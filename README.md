@@ -18,8 +18,8 @@ Kept deliberately granular. "Compiles" is not "works", and simulated is not phys
 | Category | State |
 | --- | --- |
 | Implemented | HAL, shared SPI bus manager, per-instance SHTP transport, minimal SH-2 (product ID, reset, set/get feature, Rotation Vector), `Sensor` state machine, CRC-framed binary output, single-sensor example, host test suite |
-| Compiled | `esp32:esp32:esp32s3`, ESP32 Arduino core 3.3.12 — 324 262 B flash (24 %), 23 880 B static RAM (7 %) for the example |
-| Host-unit-tested | 30 cases / 168 checks, 0 failures (MSVC 2022, `test/native`) |
+| Compiled | `esp32:esp32:esp32s3`, ESP32 Arduino core 3.3.12 — 324 174 B flash (24 %), 23 880 B static RAM (7 %) for the example |
+| Host-unit-tested | 39 cases / 185 checks, 0 failures (MSVC 2022, `test/native`) |
 | Simulated | Mock-HAL, single device. No 20-instance simulation yet |
 | Physically tested | Stages 1–2 plus the oversized-transfer drain: ESP32-S3 + Adafruit BNO085 on COM11 (CH343 UART bridge), SPI mode 3 @ 1 MHz. Boot after reset **93.7 ms**; the **552 B channel-0 advertisement** is drained in 4 bus transactions and the stream returns to idle; 0 bad fragments, 0 bus errors, 0 lock timeouts |
 
@@ -118,10 +118,12 @@ configuration, report decode, hub timestamping). Each `Sensor` owns its SHTP and
 context, so nothing about a device lives in file-scope state. Changing the sensor count
 is a runtime parameter, never a source edit.
 
-Timestamps: `tHostUs` is ESP32 `micros()` at INT assertion; `tMeasUs` is the device's
-own measurement time, `tMeas = tEdge − 12 000 µs + delayTicks × 100 µs`, kept in a
-separate clock domain and never merged. Quaternion components are reported as
-`x = i/16384, y = j/16384, z = k/16384, w = real/16384`, with the raw Q14 integers
+Timestamps: `tHostUs` is ESP32 `micros()` at INT observation; `tMeasUs` is the device's own
+measurement time, `tMeas = tEdge + (referenceDelta + delayTicks) × 100 µs`, where
+`referenceDelta` starts at 0 for each input payload, is replaced by `−timebase` when a `0xFB`
+base reference arrives and accumulates a signed `0xFA` rebase (the SH-2 `sh2.c` convention). The
+value is kept modulo 2³² and never merged into the `tHostUs` clock domain. Quaternion components
+are reported as `x = i/16384, y = j/16384, z = k/16384, w = real/16384`, with the raw Q14 integers
 preserved alongside.
 
 ## Phase 1 limitations
