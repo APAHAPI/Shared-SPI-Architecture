@@ -29,6 +29,23 @@ class IHal {
   // Returns false on a bus-level failure; never blocks indefinitely.
   virtual bool transfer(const uint8_t* tx, uint8_t* rx, size_t len) = 0;
 
+  // Continuous chip-select read.
+  //
+  // A BNO085 restarts its transfer presentation when CS is released, so an
+  // SHTP transfer must be clocked out inside ONE CS assertion: the 4-byte
+  // header first, then the remaining payload bytes. Splitting the header and
+  // the payload into two transfer() calls is not equivalent and silently
+  // corrupts every packet.
+  //
+  // beginRead() asserts CS, takes the bus and begins the transaction.
+  // read() clocks bytes while CS stays asserted. endRead() releases CS and the
+  // bus and is idempotent, so it is safe to call on every exit path, including
+  // after beginRead() failed. Nothing but SPI byte transfers may happen between
+  // beginRead() and endRead().
+  virtual bool beginRead() = 0;
+  virtual bool read(uint8_t* dst, size_t len) = 0;
+  virtual void endRead() = 0;
+
   // True while H_INTN is asserted (active low). With no INT pin configured,
   // returns true so the caller polls.
   virtual bool intAsserted() = 0;

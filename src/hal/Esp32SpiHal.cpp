@@ -13,7 +13,7 @@ Esp32SpiHal::Esp32SpiHal(SpiBusManager& bus, SPIClass* spi,
                          const ManagerConfig& managerConfig,
                          const SensorConfig& sensorConfig)
     : bus_(bus), spi_(spi), manager_(&managerConfig), config_(&sensorConfig),
-      log_(), transfers_(0), begun_(false) {
+      log_(), transfers_(0), begun_(false), readActive_(false), readBytes_(0) {
   log_.attach(managerConfig.log);
   log_.setLevel(managerConfig.logLevel);
   log_.setCategories(managerConfig.logCategories);
@@ -55,6 +55,7 @@ Status Esp32SpiHal::begin() {
 }
 
 void Esp32SpiHal::end() {
+  endRead();
   if (config_->csPin >= 0) {
     digitalWrite(config_->csPin, HIGH);
   }
@@ -86,6 +87,50 @@ bool Esp32SpiHal::transfer(const uint8_t* tx, uint8_t* rx, size_t len) {
     log_.hex(LogLevel::Trace, LogSpi, "spi-rx", rx, len);
   }
   return true;
+}
+
+// Continuous-CS read. The header and every payload byte must be clocked inside
+// one CS assertion: releasing CS mid-transfer makes the device drop the pending
+// transfer, so the next read would return a header instead of the payload.
+bool Esp32SpiHal::beginRead() {
+  if (!begun_ || readActive_) return false;
+
+  if (!bus_.beginTransaction(config_->csPin)) {
+    if (log_.enabled(LogLevel::Error, LogSpi)) {
+      log_.log(LogLevel::Error, LogSpi, "read start failed (cs=%d)",
+               static_cast<int>(config_->csPin));
+    }
+    return false;
+  }
+
+  readActive_ = true;
+  readBytes_ = 0;
+  return true;
+}
+
+bool Esp32SpiHal::read(uint8_t* dst, size_t len) {
+  if (!readActive_ || dst == nullptr || len == 0) return false;
+
+  // Only SPI byte transfers happen here: no logging while CS is asserted.
+  if (!bus_.transferInTransaction(nullptr, dst, len)) {
+    return false;
+  }
+
+  readBytes_ += static_cast<uint32_t>(len);
+  return true;
+}
+
+void Esp32SpiHal::endRead() {
+  if (!readActive_) return;  // idempotent, so every exit path may call it
+
+  bus_.endTransaction(config_->csPin);
+  readActive_ = false;
+  ++transfers_;
+
+  if (log_.enabled(LogLevel::Trace, LogCs)) {
+    log_.log(LogLevel::Trace, LogCs, "cs=%d %u bytes in one assertion",
+             static_cast<int>(config_->csPin), static_cast<unsigned>(readBytes_));
+  }
 }
 
 bool Esp32SpiHal::intAsserted() {

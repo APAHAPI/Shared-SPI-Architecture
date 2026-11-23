@@ -35,6 +35,14 @@ class SpiBusManager {
   // One CS-asserted transaction. Always releases the lock and deasserts CS.
   bool transfer(int8_t csPin, const uint8_t* tx, uint8_t* rx, size_t len);
 
+  // Continuous-CS transaction spanning several byte transfers. beginTransaction
+  // takes the lock and asserts CS; transferInTransaction clocks bytes while CS
+  // stays asserted; endTransaction always releases CS and the lock. endTransaction
+  // is idempotent. A nested or overlapping begin fails rather than deadlocking.
+  bool beginTransaction(int8_t csPin);
+  bool transferInTransaction(const uint8_t* tx, uint8_t* rx, size_t len);
+  void endTransaction(int8_t csPin);
+
   bool lock(uint32_t timeoutUs);
   void unlock();
 
@@ -46,6 +54,8 @@ class SpiBusManager {
   SPIClass* spi_;
   SPISettings settings_;
   bool begun_;
+  bool transactionHeld_;  // one CS assertion / lock spans several transfers
+  int8_t activeCsPin_;    // CS held low by the open transaction, or -1
   uint32_t lockTimeoutUs_;
   uint32_t transactions_;
   uint32_t lockTimeouts_;

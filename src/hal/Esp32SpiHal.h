@@ -26,6 +26,9 @@ class Esp32SpiHal : public IHal {
   Status begin() override;
   void end() override;
   bool transfer(const uint8_t* tx, uint8_t* rx, size_t len) override;
+  bool beginRead() override;
+  bool read(uint8_t* dst, size_t len) override;
+  void endRead() override;
   bool intAsserted() override;
   bool prepareWrite() override;
   void pulseReset() override;
@@ -40,6 +43,8 @@ class Esp32SpiHal : public IHal {
   Logger log_;
   uint32_t transfers_;
   bool begun_;
+  bool readActive_;
+  uint32_t readBytes_;
 };
 
 } // namespace bno085

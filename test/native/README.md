@@ -6,18 +6,23 @@ replace a test against a real BNO085.
 
 ## What is simulated
 
-`mock_hal.h` implements `bno085::IHal` and emulates the SPI side of the device:
+`mock_hal.h` implements `bno085::IHal` and emulates the SPI side of the device as a
+CS-driven bus, not a byte queue:
 
-- `queuePacket()` enqueues one SHTP transfer as raw bytes;
-- a 4-byte read is treated as a header peek and does **not** consume the queued
-  item, matching the fact that the device re-presents its header on each new CS
-  assertion;
-- reads longer than the queued item zero-fill and consume it (a truncated
-  transfer, which the transport must reject);
+- `queuePacket()` enqueues one complete SHTP transfer (header + payload) as one
+  device presentation;
+- `beginRead()` asserts CS and opens a transaction; `read()` clocks bytes only while
+  CS is low; `endRead()` releases CS. One queued transfer is presented per CS
+  assertion, and exhausted transfers zero-fill until CS is released;
+- releasing CS mid-transfer aborts it (`framingAborts`) and the unconsumed remainder is
+  never presented as if it belonged to the next assertion;
+- a read after `endRead()`, a second `beginRead()` inside an open read, or any other
+  illegal sequence is recorded as a `csViolation`;
+- `failTransfers` / `failReadAtByte` inject a bus failure, including mid-transfer, so
+  the test can verify that CS is released and the bus lock dropped;
 - `sent` captures every byte the driver wrote, so command framing is asserted
-  byte-for-byte;
-- `failTransfers` makes the bus fail, `intState` forces the interrupt line, and
-  `clockUs` is a manual clock so every timeout is tested without sleeping.
+  byte-for-byte; `intState` forces the interrupt line, and `clockUs` is a manual clock
+  so every timeout is tested without sleeping.
 
 The packet bytes in `test_main.cpp` are constructed from the documented SHTP and
 SH-2 layouts (datasheet 1000-3927). They are spec-derived vectors, not captures
@@ -33,7 +38,8 @@ is what the hardware bring-up checklist is for.
 | Output loss | success, full sink (atomic drop), zero-byte write, partial write, no sink (suppressed, no sequence consumed), drop-then-recovery with a consumer-visible sequence gap |
 | SHTP accept | valid rotation-vector transfer, reception timestamp propagation, sequence gap counting |
 | SHTP reject | no data, zero length, short fragment, reserved length, bad channel, oversize transfer, payload larger than payload buffer, unexpected continuation, bus error |
-| SHTP oversize drain | 552-byte advertisement consumed completely (nothing stranded, device idle afterwards), oversized continuation chain drained fragment by fragment, report arriving right after an oversize still decodes |
+| SHTP framing | one CS assertion per packet, header and payload in the same transaction, split read loses the payload, 276-byte advertisement read whole, mid-transfer failure releases CS and unlocks |
+| SHTP oversize drain | oversized transfer consumed inside one CS assertion (nothing stranded, device idle afterwards), oversized continuation chain drained fragment by fragment, report arriving right after an oversize still decodes |
 | SH-2 control | product id (4/5 entry forms), set-feature complete 21-byte frame and second-frame sequence, hub rejection, command timeout, reset-complete |
 | SH-2 reports | RV decode (Q14 + accuracy), delay ticks and timestamp reconstruction, `0xFB`/`0xFA` per-payload delta (known example, zero fallback, host-counter wrap, negative-result low 32 bits), duplicate suppression, report gaps, unknown report id |
 | Sensor FSM | full boot → identify → configure → get-feature → streaming, boot timeout, unsupported report rejection, recovery from a malformed transfer, recovery backoff |
@@ -56,23 +62,25 @@ sh test/native/build_gcc.sh
 
 Both print `RESULT: PASS` and exit non-zero on failure.
 
-The current suite is 54 cases / 348 checks. Counts in this file are exact only for the
-run recorded in `output.md`; add cases rather than trimming them when extending coverage.
+The current suite is 61 cases / 438 checks, 0 failures. Counts in this file are exact
+only for the run recorded in `hardware_test_report.md`; add cases rather than trimming
+them when extending coverage.
 
 ## Known non-goals
 
 `build_gcc.sh` is provided for portability but has not been executed in this
-environment (no g++ is installed here); the MSVC build is the one that ran.
+environment (no g++ is installed here); the MSVC build is the one that ran. Address
+Sanitizer could not be linked in this MSVC installation.
 
 Oversized SHTP transfers are drained rather than reassembled. With
-`kRxTransferBytes` = 256 and `kRxPayloadBytes` = 192, every payload the device
-can produce fits in one transfer, but the channel-0 advertisement (552 B on the
-tested part) does not, so the drain path runs on every cold boot.
+`kRxTransferBytes` = 512 and `kRxPayloadBytes` = 320, the 276-byte channel-0
+advertisement (272-byte payload) is read and delivered normally; only genuinely larger
+payloads take the bounded drain path, inside the same CS assertion.
 
-The drain accounting invariant, which the mock enforces and which the hardware
-confirmed: the 4-byte header peek does not consume anything, so a read that
-starts a transfer must clock out the full `length` bytes, header included.
-Draining `length - 4` strands 4 payload bytes; the device then re-presents them
-and the next `service()` parses payload as a header. Two regression cases cover
-this (`shtp_oversize_drain_complete`, `shtp_oversize_continuation`) and both
-fail if the subtraction is reintroduced.
+The framing invariant the mock enforces: one device presentation per CS assertion. The
+header and the whole payload must be clocked before CS is released. A split read (header
+in one assertion, payload in another) does not continue the transfer, and the mock's
+`shtp_split_read_loses_payload` case reproduces that failure. Draining fewer than
+`length` bytes strands the remainder; `shtp_oversize_drain_complete` and
+`shtp_oversize_continuation` cover the accounting and fail if the subtraction is
+reintroduced.

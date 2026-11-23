@@ -66,8 +66,27 @@ class ShtpTransport {
   const ShtpStats& stats() const { return stats_; }
 
  private:
-  bool readRaw(uint8_t* dst, size_t len);
-  bool discard(size_t len);
+  // Diagnostics for one transfer. They are recorded while CS is asserted and
+  // emitted by logRead() only after CS has been released, so no serial or other
+  // slow work can stretch the chip-select window.
+  enum class ReadIssue : uint8_t {
+    None = 0,
+    StartFailed,
+    HeaderFailed,
+    BodyFailed,
+    Spurious,
+    ReservedLength,
+    ShortFragment,
+    BadChannel,
+    UnexpectedContinuation,
+    InterruptedPayload,
+    OversizeDrained,
+    PayloadTooLarge,
+  };
+
+  ShtpResult readTransfer(uint32_t tEdgeUs);
+  bool drainWithinTransfer(uint32_t totalLength);
+  void logRead(ShtpResult result);
 
   IHal* hal_;
   Logger* log_;
@@ -88,6 +107,24 @@ class ShtpTransport {
   uint8_t nextInSeq_[shtp::kMaxChannels];
   uint8_t nextOutSeq_[shtp::kMaxChannels];
   bool channelSeen_[shtp::kMaxChannels];
+
+  ReadIssue issue_;
+  bool haveHeader_;
+  uint16_t hdrLength_;
+  uint8_t hdrChannel_;
+  uint8_t hdrSequence_;
+  bool hdrContinuation_;
+  bool gapSeen_;
+  uint8_t gapExpected_;
+  uint8_t gapActual_;
+  uint8_t gapChannel_;
+  uint32_t extraValue_;
+
+  // Payload is handed to the channel handler only after CS has been released.
+  bool deliver_;
+  uint16_t assembledLength_;
+  uint8_t assembledChannel_;
+  uint32_t assembledTimestampUs_;
 
   ShtpStats stats_;
 };

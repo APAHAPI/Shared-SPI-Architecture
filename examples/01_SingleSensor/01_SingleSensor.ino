@@ -7,14 +7,19 @@
 //   CS   -> BNO085_CS_PIN    (10)
 //   INT  -> BNO085_INT_PIN   (9,  H_INTN, active low)
 //   RST  -> BNO085_RESET_PIN (8,  NRST, active low; -1 if not wired)
-//   PS0 and PS1 must be HIGH at reset for SPI mode.
+//   PS0 and PS1 must be HIGH at reset for SPI mode. After reset PS0 is the WAKE
+//   input: connect it to a GPIO (BNO085_WAKE_PIN). With PS0 tied HIGH the hub
+//   stops accepting host writes as soon as it is idle, so Product ID and feature
+//   configuration time out even though reads work.
 //
 // Set BNO085_BINARY_OUTPUT to 1 to stream the compact binary protocol on
 // Serial instead of human-readable lines. The two must not be mixed on one
 // port: text would corrupt the frames.
 //
-// This sketch is the Phase 1 acceptance sketch. It has been compiled but not
-// run against hardware in this repository.
+// This sketch is the Phase 1 acceptance sketch. It has been run on the Stage 1
+// bench (ESP32-S3 + BNO085 on COM11): the 276-byte advertisement and reset-complete
+// read correctly, but Product ID is blocked until PS0/WAKE is wired to a GPIO.
+// See hardware_test_report.md.
 //
 // Timestamp diagnostic (`dt=` on each RV line):
 //   dt = tHost - tMeas, printed as a signed value. It is the interval between
@@ -37,7 +42,7 @@
 #define BNO085_CS_PIN 10
 #define BNO085_INT_PIN 9
 #define BNO085_RESET_PIN 8
-#define BNO085_WAKE_PIN -1  // PS0/WAKE, only needed if commands time out
+#define BNO085_WAKE_PIN -1  // PS0/WAKE: wire to a GPIO for SPI; -1 skips wake
 
 #define BNO085_SPI_HZ 1000000  // raise to 3000000 once the wiring is proven
 

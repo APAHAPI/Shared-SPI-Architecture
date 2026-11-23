@@ -170,13 +170,11 @@ reach `Streaming` in roughly one boot period plus N × a few configuration excha
 H_INTN ↓  ─► ISR: mask |= (1<<i); tEdge[i] = micros()
 update()  ─► pick next pending sensor (round robin)
              acquire bus (bounded)
-             CS↓
+             CS↓   (SPI mode applied before CS falls)
              SPI read 4 bytes → len = header[0] | header[1]<<8
              if len == 0 → release, treat as spurious INT
+             SPI read remaining len - 4 bytes   (CS stays low)
              CS↑   (device deasserts INT ~800 ns after CS is observed)
-             CS↓
-             SPI read len bytes (header repeated + payload)
-             CS↑
              release bus
              SHTP: validate len, channel, sequence; assemble fragments
              SH-2 : iterate reports inside payload (a payload may carry several)
@@ -185,10 +183,13 @@ update()  ─► pick next pending sensor (round robin)
              store latest + enqueue 32-byte Record
 ```
 
-Why two reads: the datasheet (§1.3.1) documents exactly this — read the first four
-bytes to learn how many clocks are needed, then repeat the read for the full transfer.
-The header is therefore transmitted twice, which costs 4 wire bytes per transfer
-(accounted for in the bandwidth numbers).
+**One continuous CS per transfer.** The BNO085 presents one SHTP transfer per CS
+assertion and drops the remainder when CS is released. The 4-byte header and the body
+must therefore be clocked inside the same assertion. Reading the header and then
+re-asserting CS for the body returns a re-presented or next transfer, not the payload
+described by that header; that split read was the Phase 1 read-framing defect. The
+header is transmitted once per transfer, and the cost accounting in
+[RESOURCE-ANALYSIS.md](RESOURCE-ANALYSIS.md) reflects that.
 
 **Phase 1 implementation note.** There is no ISR. `Sensor::serviceBus()` polls
 `IHal::intAsserted()`; on the rising observation it latches `intEdgeUs_ = micros()`.
@@ -221,10 +222,11 @@ write is bounded and never holds the bus or CS. Loss is counted per cause and ex
 
 ### 4.4 Where CPU time goes
 
-Per report the ESP32-S3 does: 2 SPI transactions, one header parse, one report decode
-(integer only), one timestamp reconstruction, one ring-buffer push, and 34 bytes of
-framing. There is no floating-point work in the hot path unless the application asks
-for float output (see §9.3).
+Per report the ESP32-S3 does one CS assertion (one device presentation: 4-byte header
+plus payload), one header parse, one report decode (integer only), one timestamp
+reconstruction, one ring-buffer push, and 34 bytes of framing. There is no
+floating-point work in the hot path unless the application asks for float output
+(see §9.3).
 
 ---
 
@@ -289,10 +291,14 @@ timestamp extrapolation are per device. A shared pending-request slot means a
 ### 6.1 Bus invariants
 
 1. At most one CS is low at any moment.
-2. CS is low only between `acquire()` and `release()` of the bus lock.
+2. CS is low only inside `beginTransaction()` / `endTransaction()`, under the bus
+   lock. One SHTP transfer — header and payload — occupies exactly one such window.
 3. Every transaction uses `SPI_MODE3`, MSB-first, and the configured clock
-   (default 1 MHz for bring-up, max 3 MHz per datasheet §6.5.2).
-4. CS is deasserted even on early return, via an RAII guard.
+   (default 1 MHz for bring-up, max 3 MHz per datasheet §6.5.2). The mode and clock
+   are applied **before** CS falls, and the transaction is ended **after** CS rises.
+4. CS is deasserted on every exit path. `endTransaction()` is idempotent, and
+   `end()`/teardown deasserts the remembered active CS pin even if a read was
+   abandoned.
 5. All CS pins are driven HIGH and the bus is initialised **before** any device is
    reset, so no device sees a floating select during boot.
 6. A transaction that fails leaves the bus unlocked and CS high; the failure is
@@ -303,7 +309,7 @@ timestamp extrapolation are per device. A shared pending-request slot means a
 `SpiBusManager` owns the peripheral and the lock. Each `IHal` instance holds a
 reference to the bus plus its own CS pin, so a HAL cannot accidentally touch the bus
 without acquiring it. Sensors therefore never know the bus exists — they see
-`read()/write()/intAsserted()/reset()/timeUs()`.
+`beginRead()/read()/endRead()/write()/intAsserted()/reset()/timeUs()`.
 
 Foreign devices (an SD card, a display) can share the bus through the same manager
 (`bus.withBus(fn)`), which is the only supported way to avoid a foreign driver
@@ -314,8 +320,14 @@ interleaving a transaction with a sensor read.
 - FreeRTOS recursive-free binary mutex, created in `begin()`.
 - `acquire(timeoutUs)` is **bounded** (default 2 ms). On timeout the sensor is skipped
   this pass and `diag.busBusy++` is incremented; no spin, no priority inversion.
+- `beginTransaction()` takes the mutex, applies `SPI_MODE3`, then asserts CS.
+  `transferInTransaction()` clocks bytes with CS held low. `endTransaction()` raises
+  CS, ends the SPI transaction and releases the lock. Because the lock spans the whole
+  header-and-payload read, another device cannot interleave a CS assertion.
 - `SPI.beginTransaction()` / `endTransaction()` are nested inside the mutex, never
   outside, so the ESP32 driver's own arbitration cannot reorder transactions.
+- `endTransaction()` is idempotent and safe from bus teardown, so an aborted read
+  cannot leave CS asserted or the bus locked.
 - The lock is never held while calling application callbacks or writing to USB.
 
 ### 6.4 Interrupt path

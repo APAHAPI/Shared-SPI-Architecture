@@ -480,38 +480,43 @@ void testShtpBadChannel() {
 
 void testShtpOversizeTransfer() {
   TransportFixture fx;
-  std::vector<uint8_t> payload(296, 0x55);  // declared length 300 > transfer buffer
+  std::vector<uint8_t> payload(600, 0x55);  // declared length 604 > transfer buffer
   fx.hal.queuePacket(makePacket(3, 0, payload));
   CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Oversize);
   CHECK(fx.shtp.stats().oversizePayloads == 1);
   CHECK(fx.calls == 0);
+  CHECK(fx.hal.csAssertions == 1);
+  CHECK(fx.hal.framingAborts == 0);
 }
 
 void testShtpPayloadExceedsPayloadBuffer() {
   TransportFixture fx;
-  // Fits the transfer buffer (204 <= 256) but not the payload buffer (200 > 192).
-  std::vector<uint8_t> payload(200, 0x11);
+  // Fits the transfer buffer (328 <= 512) but not the payload buffer (324 > 320).
+  std::vector<uint8_t> payload(324, 0x11);
   fx.hal.queuePacket(makePacket(3, 0, payload));
   CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Oversize);
   CHECK(fx.calls == 0);
   CHECK(fx.shtp.stats().oversizePayloads == 1);
+  CHECK(fx.hal.csAssertions == 1);
+  CHECK(fx.hal.framingAborts == 0);
 }
 
-// Regression for the oversized-transfer drain. The 4-byte header peek does not
-// consume anything, so the drain must clock out the full `length` bytes. Taking
-// length - 4 stranded the last 4 payload bytes; the device re-presented them and
-// every later service() parsed payload as a header (bad channel / short fragment
-// storm, INT never deasserting). The 552-byte advertisement hits this on every
-// cold boot.
+// Regression for the oversized-transfer drain. The header is consumed inside the
+// same CS assertion as the rest of the transfer, so the drain must clock exactly
+// the remaining length - 4 bytes. Stopping short strands a tail; over-reading
+// eats the next transfer's header. Both used to desynchronise the stream.
 void testShtpOversizeDrainConsumesWholeTransfer() {
   TransportFixture fx;
-  const std::vector<uint8_t> payload(548, 0x5A);  // 552 bytes total: advertisement
+  const std::vector<uint8_t> payload(600, 0x5A);  // 604 bytes total
   fx.hal.queuePacket(makePacket(0, 0, payload));
 
   CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Oversize);
   CHECK(fx.shtp.stats().oversizePayloads == 1);
   CHECK(fx.hal.queue.empty());     // nothing stranded on the wire
   CHECK(fx.hal.partialPos == 0);
+  CHECK(fx.hal.csAssertions == 1); // header + drain in ONE assertion
+  CHECK(fx.hal.framingAborts == 0);
+  CHECK(!fx.hal.csAsserted);
   CHECK(fx.shtp.stats().badFragments == 0);
   CHECK(fx.shtp.stats().shortFragments == 0);
 
@@ -523,25 +528,42 @@ void testShtpOversizeDrainConsumesWholeTransfer() {
   CHECK(fx.shtp.service(3000) == bno085::ShtpResult::Ok);
   CHECK(fx.calls == 1);
   CHECK(fx.lastChannel == 3);
+  CHECK(fx.hal.csAssertions == 2);
   CHECK(fx.shtp.stats().badFragments == 0);
   CHECK(fx.shtp.stats().shortFragments == 0);
 }
 
-// A continuation chain must drain every fragment by its own length, including
-// the fragment header, and still end idle.
+// A fragmented transfer: the oversized first fragment is drained in its own CS
+// assertion, and the following continuation fragment is a separate device
+// presentation with its own assertion. It is consumed and rejected (there is no
+// assembly path at this buffer size) without poisoning the stream.
 void testShtpOversizeContinuationChain() {
   TransportFixture fx;
   const std::vector<uint8_t> first(548, 0x11);   // 552, continuation set
-  const std::vector<uint8_t> second(300, 0x22);  // 304, also oversized
+  const std::vector<uint8_t> second(300, 0x22);  // 304, continuation set
   fx.hal.queuePacket(makePacket(0, 0, first, true));
-  fx.hal.queuePacket(makePacket(0, 1, second, false));
+  fx.hal.queuePacket(makePacket(0, 1, second, true));
 
   CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Oversize);
+  CHECK(fx.hal.csAssertions == 1);
+  CHECK(fx.hal.csDeassertions == 1);
+  CHECK(fx.hal.framingAborts == 0);
+  CHECK(fx.hal.queue.size() == 1);  // fragment 2 waits for its own CS
+
+  CHECK(fx.shtp.service(2000) == bno085::ShtpResult::Malformed);
+  CHECK(fx.shtp.stats().badFragments == 1);
+  CHECK(fx.hal.csAssertions == 2);
+  CHECK(fx.hal.framingAborts == 0);
   CHECK(fx.hal.queue.empty());
-  CHECK(fx.hal.partialPos == 0);
-  CHECK(fx.shtp.stats().badFragments == 0);
-  CHECK(fx.shtp.stats().shortFragments == 0);
-  CHECK(fx.shtp.service(2000) == bno085::ShtpResult::NoData);
+  CHECK(!fx.hal.csAsserted);
+
+  // The stream is still usable afterwards.
+  const std::vector<uint8_t> report =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  fx.hal.queuePacket(makePacket(3, 1, report));
+  CHECK(fx.shtp.service(3000) == bno085::ShtpResult::Ok);
+  CHECK(fx.calls == 1);
+  CHECK(fx.hal.csAssertions == 3);
 }
 
 void testShtpUnexpectedContinuation() {
@@ -570,6 +592,157 @@ void testShtpSequenceGapIsCounted() {
   fx.hal.queuePacket(makePacket(3, 3, report));
   CHECK(fx.shtp.service(2000) == bno085::ShtpResult::Ok);
   CHECK(fx.shtp.stats().sequenceGaps == 1);
+}
+
+// ---------------------------------------------------------------------------
+// SPI framing: CS / transaction-boundary regressions
+//
+// The BNO085 re-presents and drops a pending transfer when CS is released, so an
+// entire SHTP transfer must be clocked inside ONE CS assertion. The old mock
+// treated a 4-byte read as a free peek and hid the defect; these cases pin the
+// boundary down instead of only checking the final byte array.
+// ---------------------------------------------------------------------------
+
+void testShtpSingleCsPerPacket() {
+  TransportFixture fx;
+  const std::vector<uint8_t> report =
+      makeRotationVector(10, 0, 0, 0, 16384, 3, 0, 0);
+  const std::vector<uint8_t> packet = makePacket(3, 0, report);
+  fx.hal.queuePacket(packet);
+
+  CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Ok);
+  CHECK(fx.hal.csAssertions == 1);
+  CHECK(fx.hal.csDeassertions == 1);
+  CHECK(fx.hal.framingAborts == 0);
+  CHECK(fx.hal.csViolations == 0);
+  CHECK(!fx.hal.csAsserted);
+  CHECK(fx.hal.maxBytesPerAssertion == static_cast<uint32_t>(packet.size()));
+}
+
+void testShtpHeaderAndPayloadSameTransaction() {
+  TransportFixture fx;
+  const std::vector<uint8_t> report =
+      makeRotationVector(11, 0, 0, 0, 16384, 3, 0, 0);
+  const std::vector<uint8_t> packet = makePacket(3, 0, report);
+  fx.hal.queuePacket(packet);
+
+  CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Ok);
+  CHECK(fx.calls == 1);
+  CHECK(fx.lastLength == report.size());
+  // Exactly one packet's worth of bytes was clocked, all with CS asserted.
+  CHECK(fx.hal.bytesWhileCs == static_cast<uint32_t>(packet.size()));
+}
+
+// The defect itself: header and payload in two separate CS assertions. The mock
+// must lose the payload, exactly like the hardware did.
+void testMockSplitReadLosesPayload() {
+  test::MockHal hal;
+  const std::vector<uint8_t> payload(14, 0xAA);
+  const std::vector<uint8_t> packet = makePacket(3, 0, payload);
+  hal.queuePacket(packet);
+
+  uint8_t header[4];
+  CHECK(hal.beginRead());
+  CHECK(hal.read(header, 4));
+  hal.endRead();  // CS released between header and payload
+  CHECK(hal.framingAborts == 1);
+
+  std::vector<uint8_t> body(packet.size(), 0xEE);
+  CHECK(hal.beginRead());
+  CHECK(hal.read(body.data(), body.size()));
+  hal.endRead();
+
+  CHECK(body[0] == 0x00);  // dropped, not re-presented
+  CHECK(hal.queue.empty());
+  CHECK(hal.partialPos == 0);
+
+  // Continuing a packet after CS was released is rejected.
+  CHECK(!hal.read(body.data(), 4));
+  CHECK(hal.csViolations == 1);
+}
+
+// The measured startup advertisement is 276 bytes (272-byte payload) and must be
+// read coherently as one normal transfer, not drained.
+void testShtpAdvertisement276Consumed() {
+  TransportFixture fx;
+  std::vector<uint8_t> adv(272, 0x00);
+  const uint8_t head[14] = {0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x80,
+                            0x06, '1',  '.',  '0',  '.',  '0'};
+  std::memcpy(adv.data(), head, sizeof(head));
+
+  fx.hal.queuePacket(makePacket(0, 0, adv));
+  CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Ok);
+  CHECK(fx.calls == 1);
+  CHECK(fx.lastChannel == 0);
+  CHECK(fx.lastLength == 272);
+  CHECK(fx.lastPayload[9] == '1');
+  CHECK(fx.lastPayload[10] == '.');
+  CHECK(fx.lastPayload[13] == '0');
+  CHECK(fx.shtp.stats().oversizePayloads == 0);
+  CHECK(fx.shtp.stats().badFragments == 0);
+  CHECK(fx.shtp.stats().sequenceGaps == 0);
+  CHECK(fx.hal.csAssertions == 1);
+  CHECK(fx.hal.framingAborts == 0);
+
+  // The next packet is unaffected.
+  const std::vector<uint8_t> report =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  fx.hal.queuePacket(makePacket(3, 0, report));
+  CHECK(fx.shtp.service(2000) == bno085::ShtpResult::Ok);
+  CHECK(fx.lastChannel == 3);
+}
+
+// A mid-transfer bus failure must still release CS and leave the bus usable. The
+// next packet must decode normally.
+void testShtpMidTransferFailureReleasesCs() {
+  TransportFixture fx;
+  const std::vector<uint8_t> report =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  fx.hal.queuePacket(makePacket(3, 0, report));
+  fx.hal.failReadAtByte = 4;  // header clocks, payload read fails
+
+  CHECK(fx.shtp.service(1000) == bno085::ShtpResult::BusError);
+  CHECK(fx.shtp.stats().rxErrors == 1);
+  CHECK(!fx.hal.csAsserted);
+  CHECK(fx.hal.csAssertions == fx.hal.csDeassertions);
+  CHECK(fx.hal.framingAborts == 1);
+
+  fx.hal.failReadAtByte = -1;
+  fx.hal.queuePacket(makePacket(3, 1, report));
+  CHECK(fx.shtp.service(2000) == bno085::ShtpResult::Ok);
+  CHECK(fx.calls == 1);
+  CHECK(fx.lastChannel == 3);
+  CHECK(!fx.hal.csAsserted);
+}
+
+// Fragment handling: the sender sets the continuation bit on every fragment
+// after the first, so a continuation with no assembly in progress is out of
+// sequence. It must be clocked out in its own CS assertion, rejected cleanly,
+// and must not poison the next packet or strand bytes on the wire.
+void testShtpContinuationFragmentRejectedCleanly() {
+  TransportFixture fx;
+  fx.hal.queuePacket(makePacket(3, 0, std::vector<uint8_t>(6, 0x33), true));
+
+  CHECK(fx.shtp.service(1000) == bno085::ShtpResult::Malformed);
+  CHECK(fx.shtp.stats().badFragments == 1);
+  CHECK(fx.calls == 0);
+  CHECK(!fx.hal.csAsserted);
+  CHECK(fx.hal.csAssertions == 1);
+  CHECK(fx.hal.csDeassertions == 1);
+  CHECK(fx.hal.framingAborts == 0);
+  CHECK(fx.hal.queue.empty());
+
+  // The next complete packet still decodes, and its sequence is tracked.
+  const std::vector<uint8_t> report =
+      makeRotationVector(1, 0, 0, 0, 16384, 3, 0, 0);
+  fx.hal.queuePacket(makePacket(3, 1, report));
+  CHECK(fx.shtp.service(2000) == bno085::ShtpResult::Ok);
+  CHECK(fx.calls == 1);
+  CHECK(fx.lastChannel == 3);
+  CHECK(fx.lastLength == report.size());
+  CHECK(fx.shtp.stats().sequenceGaps == 0);
+  CHECK(fx.hal.csAssertions == 2);
+  CHECK(fx.hal.framingAborts == 0);
 }
 
 void testSh2ProductId() {
@@ -900,7 +1073,17 @@ void testSensorInitializationSequence() {
   fx.hal.queuePacket(makePacket(1, 0, std::vector<uint8_t>(1, 0x01)));
   fx.sensor.update();
   CHECK(fx.sensor.state() == bno085::State::Identifying);
-  CHECK(!fx.hal.sent.empty());
+  // Identifying only: no command has been written yet. (The old suite checked
+  // `sent` here, but the mock also recorded read filler bytes there, so it never
+  // actually proved that anything had been written.)
+  CHECK(fx.hal.sent.empty());
+
+  // Next pass is the identify request: one 6-byte SHTP transfer on control.
+  fx.sensor.update();
+  CHECK(fx.hal.sent.size() == 1);
+  CHECK(fx.hal.sent[0].size() == 6);
+  CHECK(fx.hal.sent[0][2] == bno085::shtp::kChannelControl);
+  CHECK(fx.hal.sent[0][4] == bno085::sh2::kProdIdReq);
 
   fx.hal.queuePacket(makePacket(2, 0, makeProductId(10004158u, 1u, 2, 3, 1)));
   fx.sensor.update();
@@ -908,7 +1091,9 @@ void testSensorInitializationSequence() {
   CHECK(fx.sensor.productInfo().valid);
 
   fx.sensor.update();  // sends set-feature
-  CHECK(fx.hal.sent.size() >= 2);
+  CHECK(fx.hal.sent.size() == 2);
+  CHECK(fx.hal.sent[1][2] == bno085::shtp::kChannelControl);
+  CHECK(fx.hal.sent[1][4] == bno085::sh2::kSetFeatureCmd);
 
   // No 0xF1 is queued: the reference completes set-feature on send, so the
   // stage advances without an acknowledgement.
@@ -916,6 +1101,9 @@ void testSensorInitializationSequence() {
   CHECK(fx.sensor.state() == bno085::State::Configuring);
 
   fx.sensor.update();  // sends get-feature
+  CHECK(fx.hal.sent.size() == 3);
+  CHECK(fx.hal.sent[2][4] == bno085::sh2::kGetFeatureReq);
+
   fx.hal.queuePacket(makePacket(2, 1, makeGetFeatureResponse(0x05, 10000)));
   fx.sensor.update();
   CHECK(fx.sensor.state() == bno085::State::Streaming);
@@ -931,6 +1119,29 @@ void testSensorInitializationSequence() {
   CHECK(nearly(q.x, 0.25f));
   CHECK(fx.sensor.diagnostics().reportsDecoded == 1);
   CHECK(!fx.sensor.latest(q));  // edge-triggered
+}
+
+// Hardware-discovered boot ordering: the advertisement can arrive while the hub
+// is still booting. Only reset-complete is a readiness signal, so the command
+// phase must not start before it. Sending the product-id request after the
+// advertisement alone produced a hub-status reply and then a timeout.
+void testSensorWaitsForResetComplete() {
+  SensorFixture fx;
+  CHECK(fx.sensor.begin(fx.manager, fx.config, 0).ok());
+
+  fx.hal.queuePacket(makePacket(0, 0, std::vector<uint8_t>(8, 0x42)));
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Booting);
+  CHECK(fx.hal.sent.empty());
+
+  fx.hal.queuePacket(makePacket(1, 0, std::vector<uint8_t>(1, 0x01)));
+  fx.sensor.update();
+  CHECK(fx.sensor.state() == bno085::State::Identifying);
+  CHECK(fx.hal.sent.empty());
+
+  fx.sensor.update();
+  CHECK(fx.hal.sent.size() == 1);
+  CHECK(fx.hal.sent[0][4] == bno085::sh2::kProdIdReq);
 }
 
 void testSensorBootTimeout() {
@@ -1162,6 +1373,7 @@ void testSensorSurvivesMalformedPacket() {
   SensorFixture fx;
   CHECK(fx.sensor.begin(fx.manager, fx.config, 0).ok());
   fx.hal.queuePacket(makePacket(0, 0, std::vector<uint8_t>(4, 0)));
+  fx.hal.queuePacket(makePacket(1, 0, std::vector<uint8_t>(1, 0x01)));
   fx.sensor.update();
   fx.hal.queuePacket(makePacket(2, 0, makeProductId(10004158u, 1u, 2, 3, 1)));
   fx.sensor.update();
@@ -1226,6 +1438,13 @@ int main() {
       {"shtp_unexpected_continuation", testShtpUnexpectedContinuation},
       {"shtp_bus_error", testShtpBusError},
       {"shtp_sequence_gap", testShtpSequenceGapIsCounted},
+      {"shtp_single_cs_per_packet", testShtpSingleCsPerPacket},
+      {"shtp_header_payload_same_cs", testShtpHeaderAndPayloadSameTransaction},
+      {"shtp_split_read_loses_payload", testMockSplitReadLosesPayload},
+      {"shtp_advertisement_276", testShtpAdvertisement276Consumed},
+      {"shtp_mid_transfer_failure_releases_cs",
+       testShtpMidTransferFailureReleasesCs},
+      {"shtp_continuation_fragment_clean", testShtpContinuationFragmentRejectedCleanly},
       {"sh2_product_id", testSh2ProductId},
       {"sh2_set_feature_bytes", testSh2SetFeatureBytes},
       {"sh2_rotation_vector_decode", testSh2RotationVectorDecode},
@@ -1251,6 +1470,7 @@ int main() {
       {"time_delta_boundary", testTimeDeltaBoundary},
       {"sh2_reset_complete", testSh2ResetComplete},
       {"sensor_init_sequence", testSensorInitializationSequence},
+      {"sensor_waits_for_reset_complete", testSensorWaitsForResetComplete},
       {"sensor_boot_timeout", testSensorBootTimeout},
       {"sensor_recovery_succeeds", testSensorRecoverySucceeds},
       {"sensor_recovery_exhausts", testSensorRecoveryExhaustsAndTerminates},

@@ -29,7 +29,7 @@ if errorlevel 1 (
 )
 
 build\native_tests.exe
-if errorlevel 1 (
+if not "%errorlevel%"=="0" (
   echo RESULT: FAIL
   exit /b 1
 )

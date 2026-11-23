@@ -25,17 +25,17 @@ GRV configuration is rejected with `UnsupportedReport`).
 | 2 | Use the CEVA SH-2 library where possible | Own minimal SHTP + SH-2 for product id, reset, set/get feature and Rotation Vector | The upstream library is a process-wide singleton with unbounded wait loops; both are disqualifying for a shared-bus design. See `UPSTREAM-AUDIT.md` |
 | 3 | Frame sequence is a 32-bit field at offset 6 | 16-bit sequence at offset 6 | The table entry (offset 6, 4 bytes) overlaps the payload at offset 8 and makes the frame 36 B, which contradicts the same document's 34 B quaternion frame, 74 B maximum frame, and CRC range `[2, 8+N)`. The 8-byte header is what the bandwidth analysis in `RESOURCE-ANALYSIS.md` assumes, so the header was kept and the field narrowed. `API.md` §4.1 now states the 16-bit rule. Hosts must compute loss modulo 65536 |
 | 4 | `tMeas` reconstructed from the datasheet | `tMeas = tObservation + (referenceDelta + delayTicks) × 100 µs`; `referenceDelta` starts at 0 per payload, `0xFB` sets `−timebase`, `0xFA` adds a signed rebase | Pass 3 corrected the report IDs/channel and pass 4 made the per-payload fallback reference-exact. `tObservation` is the polled host time, not the physical INT edge (see §6.4 in `ARCHITECTURE.md`) |
-| 5 | Handle fragmented or continued SHTP transfers | Oversize transfers are drained in bounded chunks following continuation headers; the payload is not assembled | The real advertisement is 552 B (measured), larger than the 256 B transfer buffer and the 192 B payload buffer. Assembling everything would cost ~1.1 KB more per sensor for a payload nothing consumes. The drain is bounded to 8 fragments |
-| 6 | Full wake/reset sequencing | Reset pulse implemented; optional `wakePin` supported but defaults to `-1` | Whether a given board wires PS0/WAKE is a board decision; the HAL supports it and the default assumes the part is awake |
+| 5 | Handle fragmented or continued SHTP transfers | Oversize transfers are drained inside the same CS assertion; the payload is not assembled | The advertisement is 276 B (measured; the earlier 552 B figure was a one-bit slip and is invalidated). With `BNO085_RX_TRANSFER_BYTES` = 512 it is buffered normally. Payloads larger than `BNO085_RX_PAYLOAD_BYTES` (320) or transfers larger than 512 B are drained in bounded chunks in the same CS window. A continuation fragment is a separate device presentation and is rejected cleanly rather than clocked with CS still low |
+| 6 | Full wake/reset sequencing | Reset pulse implemented; `wakePin` drives PS0/WAKE HIGH through reset and pulses it low before a write | The HAL supports it, but the Stage 1 board has PS0 tied HIGH and `wakePin = -1`. With PS0 HIGH the hub accepts host writes only while it asserts INT; once the boot reads are consumed, INT is idle and the write is dropped. This currently blocks Product ID, so PS0/WAKE must be wired to a GPIO |
 | 7 | `Sensor::get()` delivers records | Returns `false` in Phase 1 | Records are delivered through the callback and the output sink; the manager queue that backs `get()` is Phase 2 |
-| 8 | Advertisement is ~276 B (implied by the channel math) | 552 B on the tested part | Measured on hardware. `MAX_PAYLOAD_IN`-style assumptions in the upstream docs are 4 × 68 B entries; this firmware sends twice that. Any buffer sizing based on 276 B would fail at the first packet of every cold boot |
+| 8 | Advertisement is ~276 B (implied by the channel math) | 276 B on the tested part (272-byte payload) | Confirmed on hardware with one continuous CS assertion. The earlier 552 B figure was `0x0114 << 1`, a one-bit slip caused by releasing CS between header and body and by applying SPI mode 3 after CS was already low. That measurement is invalid |
 
 > **Superseded (2026-11-19).** Deviation 4 and the host-test count below described the
 > Phase 1 delivery. Pass 3 corrected the timestamp IDs/channel handling; pass 4 made
 > the per-payload fallback reference-exact (0 ticks, no negative clamp); pass 6 added
 > bounded automatic recovery, output loss accounting and the formal polling/observation
 > timestamp contract. Current behaviour is in `output.md` and `README.md`. The suite is
-> now 54 cases / 348 checks.
+> now 61 cases / 438 checks, 0 failures.
 
 ## Evidence
 
@@ -45,91 +45,87 @@ SPI mode 3 at 1 MHz, pins 12/11/13/10/9/8):
 | Item | Result |
 | --- | --- |
 | Upload | `Hash of data verified`, hard reset, exit 0 |
-| Bus + CS | `hal.begin -> ok`; 4 transactions; 0 lock timeouts; 0 bus errors |
-| Boot after reset pulse | INT asserted after **93 665 µs** (datasheet typical 90 + 4 ms) |
-| First packet | `len=552 ch=0 seq=0`, continuation bit clear |
-| Packet consumption | 552 B drained in 3 bounded chunks; then INT deasserted (no leftover fragments) |
-| `sizeof(Quaternion)` / `sizeof(Diagnostics)` | 44 B / 124 B |
-| Transport drain of the 552 B advertisement | one `Oversize` result, 4 bus transactions (peek + 256 + 256 + 40), device idle afterwards, 0 bad fragments, 0 short fragments, 0 rx errors |
-| Timestamps drift / cold boots | not measured (stages 3–8 not started) |
+| Bus + CS | `hal.begin -> ok`; one CS assertion per packet; 0 lock timeouts; 0 bus errors |
+| Boot after reset pulse | INT asserted after **93.9 ms** (datasheet typical 90 + 4 ms) |
+| First packet | `hdr len=276 cont=0 ch=0 seq=0`; 272-byte payload; contains `1.0.0` |
+| Packet consumption | 276 B read inside one CS assertion; `oversize=0`, `badFrag=0`, `seqGaps=0`; INT deasserts |
+| `sizeof(Quaternion)` / `sizeof(Diagnostics)` | 44 B / 176 B |
+| Product ID | **blocked**: `product=0x00000000`; PS0/WAKE is not wired (see `hardware_test_report.md` §9) |
+| Timestamps drift / cold boots | not measured (stages 3-8 not started) |
 
 **Host tests at Phase 1 delivery:** 168 checks across 30 cases, 0 failures, via
 `test\native\build_msvc.bat` (MSVC 2022). See `test/native/README.md` for what each
-case covers and for the simulated-versus-real distinction. **Current suite:** 54 cases /
-348 checks, 0 failures; it now includes bounded recovery, exhaustion/manual recovery,
-transport-fault and silence triggers, output loss accounting, and polling observation
-time.
+case covers and for the simulated-versus-real distinction. **Current suite:** 61 cases /
+438 checks, 0 failures; it includes the continuous-CS framing regressions, bounded
+recovery, exhaustion/manual recovery, transport-fault and silence triggers, output loss
+accounting, and polling observation time.
 
-## Transport fix: oversized transfer drain (validated on hardware)
+## Transport fix: continuous-CS SHTP read (validated on hardware)
 
-**Failure.** Every cold boot, `service()` returned `Oversize` for the 552-byte
-channel-0 advertisement and left the stream desynchronised: the device kept INT
-asserted, and each following `service()` parsed payload bytes as a header, so it
-reported malformed/oversize results indefinitely. Probe v2 showed the same symptom as
-295 consecutive transfer failures.
+**Failure.** `service()` read the 4-byte header in one CS assertion and the payload in a
+second. The BNO085 drops and re-presents a transfer when CS is released, so the body read
+never returned the payload the header described. Every packet was misparsed, the device
+stayed busy, and the original report's 552-byte/`Oversize` symptoms followed.
 
-**Root cause.** Byte accounting, not protocol design. `service()` peeks the 4-byte
-header with a non-consuming read and then re-reads the transfer from the start, so
-`length` (which counts the whole transfer) is still entirely on the wire. The oversize
-drain subtracted the header (`remaining = length - 4`) and clocked out only 548 of 552
-bytes. The device re-presented the surviving 4 payload bytes, and the transport read
-them as a length/channel/sequence. Same off-by-4 on each continuation fragment
-(`lenNext - 4`). `discard()` was already correct because it drains `length` bytes from
-the start.
+**Second cause, exposed by the first cold boot after the split read was fixed.**
+`SpiBusManager` asserted CS before `SPI.beginTransaction()` applied `SPI_MODE3`. On the
+first transfer after `SPI.begin()` the clock changes from idle-low to idle-high while the
+device is selected; the device sees one extra edge and the header shifts by one bit:
+`0x0114` (276) reads as `0x0228` (552). The final cold-boot capture reproduced exactly
+this (`552 > 512`); after reordering, the first boot reads 276.
 
-**Fix.** Two expressions changed to drain the full `length` / `lenNext`; plus removal
-of an `rxErrors` increment that flagged a legal, fully-drained transfer as a bus
-error (it made a healthy boot indistinguishable from a desync in diagnostics).
-Nothing else changed: per-sensor SHTP context, shared bus manager, buffer sizes,
-result codes, timeouts and the bounded 8-fragment guard are untouched.
+**Fix.** `IHal` gained `beginRead()/read()/endRead()`; `SpiBusManager` gained
+`beginTransaction()/transferInTransaction()/endTransaction()`. One bounded bus lock and
+one CS assertion now span the header and the whole payload; `endTransaction()` is
+idempotent and releases CS before ending the SPI transaction; `end()` remembers the
+active CS pin. The bus is put into `SPI_MODE3` before CS is asserted and is only returned
+after CS is high. `ShtpTransport` defers all logging and payload delivery until after
+`endRead()`. `BNO085_RX_TRANSFER_BYTES` is 512 and `BNO085_RX_PAYLOAD_BYTES` is 320, so
+the 276-byte advertisement (272-byte payload) is buffered and delivered normally; larger
+payloads still take the bounded drain path inside the same CS assertion.
+`test/native/mock_hal.h` now models CS assertion/deassertion, transaction boundaries,
+bytes clocked per assertion, aborts on mid-transfer release, illegal reads and injected
+mid-transfer failures.
 
-**Procedure.**
+**Procedure and result (host).** `test\native\build_msvc.bat` -> 61 cases / 438 checks,
+0 failures; `/analyze` -> 0 warnings. The 10 framing/recovery regressions are listed in
+`hardware_test_report.md` §5.5.
 
-1. `test\native\build_msvc.bat` — 54 cases / 348 checks (30 cases / 168 checks at the
-   time of this fix).
-2. Re-introduce `length - 4` temporarily: 6 checks fail in the two regression cases,
-   confirming the tests detect the defect rather than merely coexisting with it.
-3. Compile `test/hardware/02_TransportDrain` for `esp32:esp32:esp32s3`.
-4. `arduino-cli upload -p COM11 --fqbn esp32:esp32:esp32s3 --input-dir build/transportdrain`.
-5. `arduino-cli monitor -p COM11 -c baudrate=115200` for 20 s.
+**Procedure and result (COM11, 2026-11-23).**
 
-The harness drives the real `ShtpTransport` — reset, then `service()` while INT is
-asserted — with no SH-2 traffic, so it does not begin stage 3.
+1. `arduino-cli compile ... --warnings all examples/01_SingleSensor` -> no warnings,
+   326 806 B flash / 24 640 B RAM.
+2. Upload to COM11, reset, capture at Trace: `hdr len=276 cont=0 ch=0 seq=0`, payload
+   `[272]` containing `1.0.0`, then a 20-byte control packet and a 5-byte reset-complete.
+3. Final Info build, RTS cold boot: `oversize=0`, `badFrag=0`, `seqGaps=0`,
+   `maxService=2367 us`; two complete boot bursts = `packets=6 bytes=602`.
+4. `test/hardware/02_TransportDrain` -> `RESULT: PASS - 276-byte advertisement, one CS
+   assertion per packet, stream idle` (1 transaction, 0 errors).
+5. `test/hardware/01_HeaderProbe` v4 -> 3 packets / 3 transactions, 0 errors.
 
-**Observed (COM11, 2026-11-16):**
+**Product ID is still blocked** at this point by the PS0/WAKE wiring, not by the read:
+`product=0x00000000`, `sh2-timeout`; see `hardware_test_report.md` §9.
 
-```
-=== BNO085Multi transport drain validation ===
-hal.begin -> ok
-boot: INT asserted after 93889 us (up)
-servicing while INT asserted:
-  service[1] -> Oversize
-  INT deasserted: device idle
-service calls=1 oversize=1 ok=0 other=0
-final service -> NoData (idle, no stranded tail)
-stats: packets=0 bytes=0 oversizePayloads=1 badFragments=0 shortFragments=0
-       badChannels=0 seqGaps=0 rxErrors=0
-bus transactions=4 lockTimeouts=0 busErrors=0
-RESULT: PASS - oversized transfer fully drained, stream idle
-```
-
-Four bus transactions is 1 peek + 3 reads totalling 552 bytes, i.e. the header is
-re-read as part of the first chunk and exactly the transfer is consumed. Log:
-`build/transportdrain_run3.log`.
-
-**Not proven by this.** The drain is fixed and the stream returns to idle after the
-advertisement; nothing here exercises SH-2, report configuration, timestamps or
-soak behaviour, which remain stages 3–8.
+**Earlier 552-byte drain result (invalidated).** The 552-byte advertisement and the
+"oversized transfer fully drained" PASS were a one-bit slip, not a real transfer. The old
+harness drained a re-presented/slipped presentation with split reads; returning to idle
+does not prove the payload was consumed coherently. After the fix the same harness reads
+276 B in one CS and passes. The old `length - 4` drain-accounting fix is still correct
+for genuinely oversized transfers and is covered by the host regressions.
 
 **Compilation:** `examples/01_SingleSensor` compiles for `esp32:esp32:esp32s3`
-(ESP32 core 3.3.12), 326 142 B flash (24 %), 23 968 B static RAM (7 %), no warnings with
+(ESP32 core 3.3.12), 326 806 B flash (24 %), 24 640 B static RAM (7 %), no warnings with
 `--warnings all`.
 
 ## Still to verify on hardware
 
 Stages 1–2 above are done. The rest of the Phase 1 exit criteria are open:
 
-1. **Product ID retrieval** through the SH-2 control channel.
+1. **Product ID retrieval** through the SH-2 control channel. Currently **blocked**:
+   PS0/WAKE is not wired, so the F9 request is ignored when INT is idle
+   (`product=0x00000000`, `sh2-timeout`). A probe that wrote F9 while the hub was
+   asserting INT received the real `0xF8` Product ID responses, so the read path,
+   MOSI and the decoder are proven; only the wake wiring is missing.
 2. **Rotation Vector configuration at 100 Hz** and verification of the granted
    interval (set-feature, then get-feature).
 3. **Continuous quaternion output** and decode correctness. Includes confirming the
@@ -147,5 +143,8 @@ Stages 1–2 above are done. The rest of the Phase 1 exit criteria are open:
 10. **Output backpressure**: fill the UART/USB ring and confirm frames are dropped with
     `framesNoCapacity`/`framesDropped` increasing, no stall in `service`, and a
     sequence gap visible to the PC parser.
-9. **Sleep/wake**: whether writes to a sleeping part fail, and whether PS0/WAKE must be
-   wired.
+11. **Sleep/wake**: answered for this board. PS0 is protocol-select at reset and the
+    active-low WAKE input afterwards, so it must be a GPIO, not tied HIGH. With it tied
+    HIGH, writes to an idle hub are ignored even when the part is fully awake; this is
+    the current Product ID blocker. Whether a *sleeping* part behaves differently is
+    still unmeasured, but waking is required regardless.

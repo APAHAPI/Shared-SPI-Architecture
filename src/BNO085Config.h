@@ -9,12 +9,21 @@
 #define BNO085_MAX_SENSORS 20
 #endif
 
+// The channel-0 advertisement is 276 bytes on the tested BNO085 (272-byte
+// payload), measured with a continuous-CS read. The transfer buffer must hold a
+// complete transfer, because an SHTP transfer can only be clocked out inside one
+// chip-select assertion; a transfer that does not fit is drained, never parsed.
+// 512 leaves 236 bytes of headroom over the measured advertisement.
 #ifndef BNO085_RX_TRANSFER_BYTES
-#define BNO085_RX_TRANSFER_BYTES 256
+#define BNO085_RX_TRANSFER_BYTES 512
 #endif
 
+// Assembly buffer for one payload. It must hold the advertisement payload (272)
+// so a normal boot is delivered instead of being counted as oversize; 320 keeps
+// 48 bytes of headroom while staying below the transfer buffer, so a transfer
+// whose payload cannot be assembled is still detected as oversize.
 #ifndef BNO085_RX_PAYLOAD_BYTES
-#define BNO085_RX_PAYLOAD_BYTES 192
+#define BNO085_RX_PAYLOAD_BYTES 320
 #endif
 
 #ifndef BNO085_TX_TRANSFER_BYTES

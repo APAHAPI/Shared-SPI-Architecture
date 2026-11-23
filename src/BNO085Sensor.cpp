@@ -14,7 +14,7 @@ Sensor::Sensor(IHal& hal)
     : hal_(hal), log_(), shtp_(), sh2_(), encoder_(), output_(nullptr),
       manager_(), cfg_(), diag_(), latest_(), newData_(false), started_(false),
       state_(State::Unconfigured), stage_(StageIdle), index_(0),
-      stageDeadlineUs_(0), nextAttemptUs_(0), bootPacketBaseline_(0),
+      stageDeadlineUs_(0), nextAttemptUs_(0), bootEpochBaseline_(0),
       setFeatureSent_(false), getFeatureSent_(false), intPending_(false),
       intEdgeUs_(0), lastStatusUs_(0), lastReportUs_(0), retryAtUs_(0),
       recovering_(false), recoveryAttempts_(0),
@@ -140,7 +140,12 @@ void Sensor::startBoot() {
   stage_ = StageBoot;
   setState(State::Booting);
   diag_.initStage = static_cast<uint8_t>(stage_);
-  bootPacketBaseline_ = shtp_.stats().packets;
+  // The hub is not ready for commands until it has reported reset-complete on
+  // the executable channel. The advertisement alone proves the link works but
+  // can arrive while the hub is still booting, so it must not open the command
+  // phase: a command sent that early is answered with an unsolicited hub status
+  // and then times out.
+  bootEpochBaseline_ = sh2_.epoch();
   setFeatureSent_ = false;
   getFeatureSent_ = false;
   intPending_ = false;
@@ -294,14 +299,16 @@ void Sensor::serviceBus(uint32_t nowUs) {
 void Sensor::advanceInit(uint32_t nowUs) {
   switch (stage_) {
     case StageBoot:
-      if (shtp_.stats().packets > bootPacketBaseline_) {
+      // Reset-complete, not the advertisement, is the readiness signal: it is
+      // the hub telling the host that its own initialization has finished.
+      if (sh2_.epoch() != bootEpochBaseline_) {
         stage_ = StageIdentify;
         setState(State::Identifying);
         diag_.initStage = static_cast<uint8_t>(stage_);
         stageDeadlineUs_ = nowUs + commandTimeoutUs();
         nextAttemptUs_ = nowUs;
         if (log_.enabled(LogLevel::Info, LogInit)) {
-          log_.log(LogLevel::Info, LogInit, "s%u device responded, identifying",
+          log_.log(LogLevel::Info, LogInit, "s%u device reset complete, identifying",
                    index_);
         }
       } else if (reached(nowUs, stageDeadlineUs_)) {

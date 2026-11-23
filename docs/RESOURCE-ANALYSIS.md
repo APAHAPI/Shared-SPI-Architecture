@@ -19,9 +19,9 @@ Sources for device constants: BNO08X datasheet 1000-3927 v1.8, §6.5.2 (SPI timi
 | SPI mode | 3 (CPOL=1, CPHA=1), MSB first | Datasheet §6.5.2 |
 | Rotation Vector payload | 14 B | SH-2 report 0x05 (report id, seq, status, delay, i, j, k, real, accuracy) |
 | SHTP header | 4 B | Datasheet §1.3.1 |
-| Header transmitted twice per transfer | +4 B | Datasheet §1.3.1: read 4 bytes, then repeat the read |
-| Wire bytes per RV report | 22 B = 176 bit | 4 (peek) + 4 (header) + 14 (payload) |
-| Per-report software + CS overhead | 12 µs (estimate) | 2 CS transactions, `SPI.transferBytes` overhead, decode, timestamp, enqueue. **Must be measured.** |
+| Header transmitted once per transfer | 4 B | The header and payload are clocked inside one CS assertion |
+| Wire bytes per RV report | 18 B = 144 bit | 4 (header) + 14 (payload) |
+| Per-report software + CS overhead | 12 µs (estimate) | 1 CS transaction, `SPI.transferBytes` overhead, decode, timestamp, enqueue. **Must be measured.** |
 | Report rate cases | 100 / 200 / 400 Hz | 100 Hz default |
 
 ---
@@ -30,15 +30,16 @@ Sources for device constants: BNO08X datasheet 1000-3927 v1.8, §6.5.2 (SPI timi
 
 | Clock | Pure wire time | + 12 µs overhead | Effective per report |
 | --- | --- | --- | --- |
-| 1 MHz | 176.0 µs | +12 | **188.0 µs** |
-| 2 MHz | 88.0 µs | +12 | **100.0 µs** |
-| 3 MHz | 58.7 µs | +12 | **70.7 µs** |
+| 1 MHz | 144.0 µs | +12 | **156.0 µs** |
+| 2 MHz | 72.0 µs | +12 | **84.0 µs** |
+| 3 MHz | 48.0 µs | +12 | **60.0 µs** |
 
 Notes:
 
-- The 4-byte header is paid twice because the host must first learn the length. A
-  device with several reports queued sends them in one payload, amortising this cost;
-  the table is the worst case (one report per transfer).
+- The 4-byte header is paid once: after the header is clocked, CS stays asserted and
+  the payload follows in the same transfer. A device with several reports queued sends
+  them in one payload, amortising the header cost; the table is the worst case (one
+  report per transfer).
 - Enabling extra reports increases payload bytes and therefore bus time roughly
   linearly, and also increases interrupt rate.
 
@@ -52,21 +53,21 @@ Quaternion stream only, one report per transfer, 12 µs overhead.
 
 | Sensors | Reports/s @100 Hz | Bus time/s | Utilisation | @200 Hz | @400 Hz |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 100 | 7.1 ms | 0.7 % | 1.4 % | 2.8 % |
-| 5 | 500 | 35.3 ms | 3.5 % | 7.1 % | 14.1 % |
-| 10 | 1 000 | 70.7 ms | 7.1 % | 14.1 % | 28.3 % |
-| 15 | 1 500 | 106.0 ms | 10.6 % | 21.2 % | 42.4 % |
-| 20 | 2 000 | 141.3 ms | 14.1 % | 28.3 % | 56.5 % |
+| 1 | 100 | 6.0 ms | 0.6 % | 1.2 % | 2.4 % |
+| 5 | 500 | 30.0 ms | 3.0 % | 6.0 % | 12.0 % |
+| 10 | 1 000 | 60.0 ms | 6.0 % | 12.0 % | 24.0 % |
+| 15 | 1 500 | 90.0 ms | 9.0 % | 18.0 % | 36.0 % |
+| 20 | 2 000 | 120.0 ms | 12.0 % | 24.0 % | 48.0 % |
 
 ### 3.2 At 1 MHz (bring-up default)
 
 | Sensors | @100 Hz | @200 Hz | Ceiling (80 % budget) |
 | --- | --- | --- | --- |
-| 1 | 1.9 % | 3.8 % | ~4 250 reports/s |
-| 5 | 9.4 % | 18.8 % | |
-| 10 | 18.8 % | 37.6 % | |
-| 15 | 28.2 % | 56.4 % | |
-| 20 | 37.6 % | 75.2 % | ≈ 212 Hz per sensor |
+| 1 | 1.6 % | 3.1 % | ~5 100 reports/s |
+| 5 | 7.8 % | 15.6 % | |
+| 10 | 15.6 % | 31.2 % | |
+| 15 | 23.4 % | 46.8 % | |
+| 20 | 31.2 % | 62.4 % | ≈ 256 Hz per sensor |
 
 ### 3.3 Practical ceiling
 
@@ -74,15 +75,15 @@ At an 80 % bus budget, ignoring init traffic and foreign devices:
 
 | Clock | Max report throughput | With 20 sensors | With 10 sensors |
 | --- | --- | --- | --- |
-| 1 MHz | ≈ 4 250 /s | ≈ 212 Hz each | ≈ 425 Hz each |
-| 2 MHz | ≈ 8 000 /s | ≈ 400 Hz each | ≈ 800 Hz each |
-| 3 MHz | ≈ 11 300 /s | ≈ 550 Hz each | > 1 kHz each |
+| 1 MHz | ≈ 5 100 /s | ≈ 256 Hz each | ≈ 512 Hz each |
+| 2 MHz | ≈ 9 500 /s | ≈ 477 Hz each | ≈ 952 Hz each |
+| 3 MHz | ≈ 13 300 /s | ≈ 666 Hz each | > 1 kHz each |
 
 **No promise is made that 20 sensors sustain 400 Hz.** The honest statement is:
-20 sensors at 100 Hz leave ~86 % headroom at 3 MHz; 20 at 200 Hz fit comfortably at
-2–3 MHz; 20 at 400 Hz are feasible only at 3 MHz with a clean harness, no foreign bus
-traffic, and the measured overhead at or below the 12 µs assumption. Phase 5 measures
-it.
+20 sensors at 100 Hz leave ~88 % headroom at 3 MHz; 20 at 200 Hz fit comfortably at
+2–3 MHz (24–48 % utilisation at 400 Hz); 20 at 400 Hz are feasible at 2–3 MHz with a
+clean harness, no foreign bus traffic, and the measured overhead at or below the 12 µs
+assumption. Phase 5 measures it.
 
 Interrupt load: 2 000 INT/s at 20 × 100 Hz, each ISR ≈ 1–2 µs ⇒ ≈ 0.3 % CPU.
 
@@ -101,11 +102,11 @@ duplicate reports.
 
 | Scenario | 1 MHz | 3 MHz |
 | --- | --- | --- |
-| 20 sensors assert INT simultaneously | 20 × 188 µs = 3.76 ms | 20 × 70.7 µs = 1.41 ms |
-| Plus one `update()` budget (2 ms) | 5.76 ms | 3.41 ms |
-| Margin to 10 ms | 4.2 ms | 6.6 ms |
+| 20 sensors assert INT simultaneously | 20 × 156 µs = 3.12 ms | 20 × 60 µs = 1.20 ms |
+| Plus one `update()` budget (2 ms) | 5.12 ms | 3.20 ms |
+| Margin to 10 ms | 4.88 ms | 6.80 ms |
 
-A single sensor is serviced in one visit (≤ 3 transfers, ≈ 210 µs at 3 MHz), so the
+A single sensor is serviced in one visit (≤ 3 transfers, ≈ 180 µs at 3 MHz), so the
 common case is far below the worst case.
 
 ### 4.3 Duplicate-report handling

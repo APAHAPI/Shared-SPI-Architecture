@@ -6,14 +6,6 @@
 
 namespace bno085 {
 
-namespace {
-// MOSI is ignored during reads; a shared read-only filler avoids a per-instance
-// scratch buffer and keeps every transfer byte-deterministic.
-const uint8_t kZeroFill[BNO085_RX_TRANSFER_BYTES] = {0};
-
-size_t minSize(size_t a, size_t b) { return (a < b) ? a : b; }
-} // namespace
-
 const char* shtp::channelName(uint8_t channel) {
   switch (channel) {
     case shtp::kChannelCommand:     return "command";
@@ -30,7 +22,11 @@ ShtpTransport::ShtpTransport()
     : hal_(nullptr), log_(nullptr), sensorId_(0), handler_(nullptr),
       handlerContext_(nullptr), rxTransfer_(), rxPayload_(), txTransfer_(),
       inRemaining_(0), inCursor_(0), inChannel_(0), inTimestampUs_(0),
-      nextInSeq_(), nextOutSeq_(), channelSeen_(), stats_() {}
+      nextInSeq_(), nextOutSeq_(), channelSeen_(), issue_(ReadIssue::None),
+      haveHeader_(false), hdrLength_(0), hdrChannel_(0), hdrSequence_(0),
+      hdrContinuation_(false), gapSeen_(false), gapExpected_(0), gapActual_(0),
+      gapChannel_(0), extraValue_(0), deliver_(false), assembledLength_(0),
+      assembledChannel_(0), assembledTimestampUs_(0), stats_() {}
 
 void ShtpTransport::attach(IHal* hal, Logger* log, uint8_t sensorId) {
   hal_ = hal;
@@ -54,160 +50,170 @@ void ShtpTransport::reset() {
     nextOutSeq_[i] = 0;
     channelSeen_[i] = false;
   }
-}
-
-bool ShtpTransport::readRaw(uint8_t* dst, size_t len) {
-  if (hal_ == nullptr || len == 0) return false;
-  return hal_->transfer(kZeroFill, dst, len);
-}
-
-// Reads and throws away `len` bytes so a rejected transfer does not leave the
-// device asserting INT forever. Bounded to a few transfers.
-bool ShtpTransport::discard(size_t len) {
-  const size_t limit = 4 * sizeof(rxTransfer_);
-  size_t remaining = minSize(len, limit);
-  while (remaining > 0) {
-    const size_t chunk = minSize(remaining, sizeof(rxTransfer_));
-    if (!readRaw(rxTransfer_, chunk)) return false;
-    remaining -= chunk;
-  }
-  return true;
+  issue_ = ReadIssue::None;
+  deliver_ = false;
 }
 
 ShtpResult ShtpTransport::service(uint32_t tEdgeUs) {
   if (hal_ == nullptr) return ShtpResult::BusError;
   if (!hal_->intAsserted()) return ShtpResult::NoData;
 
-  uint8_t peek[shtp::kHeaderLen];
-  if (!readRaw(peek, sizeof(peek))) {
+  // A BNO085 re-presents (and drops) a pending transfer when CS is released, so
+  // the 4-byte header and every payload byte must be clocked inside ONE CS
+  // assertion. readTransfer() opens that assertion and does nothing but SPI;
+  // endRead() closes it on every exit path, including bus failures, and is
+  // idempotent. Logging and payload delivery happen only after CS is released.
+  const ShtpResult result = readTransfer(tEdgeUs);
+  hal_->endRead();
+
+  logRead(result);
+
+  if (deliver_) {
+    deliver_ = false;
+    if (handler_ != nullptr) {
+      handler_(handlerContext_, assembledChannel_, rxPayload_, assembledLength_,
+               assembledTimestampUs_);
+    }
+  }
+  return result;
+}
+
+// Clocks and discards the rest of a transfer whose 4-byte header has already
+// been read. Stays inside the caller's CS assertion.
+bool ShtpTransport::drainWithinTransfer(uint32_t totalLength) {
+  if (totalLength <= shtp::kHeaderLen) return true;
+
+  uint32_t remaining = totalLength - shtp::kHeaderLen;
+  // Bounded: a rogue length field cannot spin here.
+  const uint32_t limit = 8u * static_cast<uint32_t>(sizeof(rxTransfer_));
+  if (remaining > limit) remaining = limit;
+
+  while (remaining > 0) {
+    const size_t chunk = (remaining < sizeof(rxTransfer_))
+                             ? static_cast<size_t>(remaining)
+                             : sizeof(rxTransfer_);
+    if (!hal_->read(rxTransfer_, chunk)) return false;
+    remaining -= static_cast<uint32_t>(chunk);
+  }
+  return true;
+}
+
+// SPI only: no logging, no payload delivery and no other work may happen between
+// beginRead() and the matching endRead() in service(), because CS stays asserted
+// for the whole time.
+ShtpResult ShtpTransport::readTransfer(uint32_t tEdgeUs) {
+  issue_ = ReadIssue::None;
+  haveHeader_ = false;
+  gapSeen_ = false;
+  deliver_ = false;
+
+  if (!hal_->beginRead()) {
+    issue_ = ReadIssue::StartFailed;
     ++stats_.rxErrors;
-    if (log_) log_->log(LogLevel::Error, LogSpi, "s%u peek transfer failed", sensorId_);
+    return ShtpResult::BusError;
+  }
+
+  // Header first, still inside the same CS assertion.
+  if (!hal_->read(rxTransfer_, shtp::kHeaderLen)) {
+    issue_ = ReadIssue::HeaderFailed;
+    ++stats_.rxErrors;
     return ShtpResult::BusError;
   }
 
   const uint16_t rawLength = static_cast<uint16_t>(
-      static_cast<uint16_t>(peek[0]) |
-      static_cast<uint16_t>(static_cast<uint16_t>(peek[1]) << 8));
+      static_cast<uint16_t>(rxTransfer_[0]) |
+      static_cast<uint16_t>(static_cast<uint16_t>(rxTransfer_[1]) << 8));
   const bool continuation = (rawLength & shtp::kContinuationBit) != 0;
   const uint16_t length = static_cast<uint16_t>(rawLength & shtp::kLengthMask);
-  const uint8_t channel = peek[2];
-  const uint8_t sequence = peek[3];
+  const uint8_t channel = rxTransfer_[2];
+  const uint8_t sequence = rxTransfer_[3];
 
-  if (log_) {
-    log_->log(LogLevel::Trace, LogShtp,
-              "s%u hdr len=%u cont=%u ch=%u(%s) seq=%u", sensorId_,
-              static_cast<unsigned>(length), continuation ? 1u : 0u,
-              static_cast<unsigned>(channel), shtp::channelName(channel),
-              static_cast<unsigned>(sequence));
-  }
+  haveHeader_ = true;
+  hdrLength_ = length;
+  hdrChannel_ = channel;
+  hdrSequence_ = sequence;
+  hdrContinuation_ = continuation;
 
   if (length == 0) {
+    issue_ = ReadIssue::Spurious;
     ++stats_.spurious;
-    if (log_) log_->log(LogLevel::Debug, LogInt, "s%u spurious INT (len 0)", sensorId_);
     return ShtpResult::Spurious;
   }
 
   if (rawLength == shtp::kReservedLength) {
+    issue_ = ReadIssue::ReservedLength;
     ++stats_.rxErrors;
     ++stats_.badFragments;
-    discard(length);
-    if (log_) log_->log(LogLevel::Warn, LogShtp, "s%u reserved length 0xFFFF", sensorId_);
+    if (!drainWithinTransfer(length)) {
+      issue_ = ReadIssue::BodyFailed;
+      return ShtpResult::BusError;
+    }
     return ShtpResult::Malformed;
   }
 
   if (length < shtp::kHeaderLen) {
+    // The header is already on the wire, so the over-read is bounded by the
+    // header size. A declared length below the header is malformed either way.
+    issue_ = ReadIssue::ShortFragment;
     ++stats_.shortFragments;
-    discard(length);
-    if (log_) log_->log(LogLevel::Warn, LogShtp, "s%u short fragment (%u)", sensorId_,
-                        static_cast<unsigned>(length));
     return ShtpResult::Malformed;
   }
 
   if (channel >= shtp::kMaxChannels) {
+    issue_ = ReadIssue::BadChannel;
     ++stats_.badChannels;
-    discard(length);
-    if (log_) log_->log(LogLevel::Warn, LogShtp, "s%u bad channel %u", sensorId_,
-                        static_cast<unsigned>(channel));
+    if (!drainWithinTransfer(length)) {
+      issue_ = ReadIssue::BodyFailed;
+      ++stats_.rxErrors;
+      return ShtpResult::BusError;
+    }
     return ShtpResult::Malformed;
   }
 
   // Sequence tracking is diagnostic only: a gap is counted, never repaired.
+  // It runs before the oversize check so a drained transfer does not make the
+  // following one look like a gap.
   if (channelSeen_[channel] && sequence != nextInSeq_[channel]) {
     ++stats_.sequenceGaps;
-    if (log_) log_->log(LogLevel::Warn, LogShtp,
-                        "s%u ch%u seq gap: expected %u got %u", sensorId_,
-                        static_cast<unsigned>(channel),
-                        static_cast<unsigned>(nextInSeq_[channel]),
-                        static_cast<unsigned>(sequence));
+    gapSeen_ = true;
+    gapChannel_ = channel;
+    gapExpected_ = nextInSeq_[channel];
+    gapActual_ = sequence;
   }
   channelSeen_[channel] = true;
   nextInSeq_[channel] = static_cast<uint8_t>(sequence + 1);
 
   if (length > sizeof(rxTransfer_)) {
-    // Legal but unbufferable transfer: it is counted, then drained in this call
-    // so the device never has to re-present a remainder. Not an rx error - the
-    // transfer behaved exactly as the protocol allows, and an error flag here
-    // would make a healthy boot indistinguishable from a desync.
-    ++stats_.oversizePayloads;
-    // Consume the whole transfer before returning. Leaving the remainder
-    // pending makes the device re-present it as continuation fragments, which
-    // then look like a stream of bogus fragments on the next service() calls.
-    // The payload cannot be assembled at this buffer size, so it is counted and
-    // discarded. Bounded to 8 fragments; a rogue device cannot spin here.
+    // Legal but unbufferable transfer: counted, then the remainder of THIS
+    // transfer is drained inside the same CS assertion, so no tail is stranded
+    // and CS is released exactly once. Not an rx error - the transfer behaved
+    // exactly as the protocol allows, and an error flag here would make a
+    // healthy boot indistinguishable from a desync.
     //
-    // `length` counts the whole transfer, header included, and the peek above
-    // consumed nothing, so all `length` bytes are still on the wire. Draining
-    // length - 4 strands the last 4 payload bytes; the device then re-presents
-    // them and the next service() parses payload as a header.
-    {
-      size_t remaining = static_cast<size_t>(length);
-      bool more = continuation;
-      uint8_t guard = 0;
-      for (;;) {
-        while (remaining > 0) {
-          const size_t chunk = (remaining < sizeof(rxTransfer_))
-                                   ? remaining
-                                   : sizeof(rxTransfer_);
-          if (!readRaw(rxTransfer_, chunk)) {
-            ++stats_.rxErrors;
-            return ShtpResult::BusError;
-          }
-          remaining -= chunk;
-        }
-        if (!more) break;
-        if (++guard > 8) {
-          ++stats_.badFragments;
-          break;
-        }
-        uint8_t next[shtp::kHeaderLen];
-        if (!readRaw(next, sizeof(next))) {
-          ++stats_.rxErrors;
-          return ShtpResult::BusError;
-        }
-        const uint16_t rawNext = static_cast<uint16_t>(next[0] | (next[1] << 8));
-        const uint16_t lenNext =
-            static_cast<uint16_t>(rawNext & shtp::kLengthMask);
-        if (next[2] != channel || lenNext < shtp::kHeaderLen) {
-          ++stats_.badFragments;
-          break;
-        }
-        more = (rawNext & shtp::kContinuationBit) != 0;
-        // Same rule for each continuation fragment: its own header is part of
-        // the count and was not consumed by the read that just finished.
-        remaining = static_cast<size_t>(lenNext);
-      }
+    // Only this transfer is drained. A following continuation fragment is a
+    // separate device presentation with its own CS assertion, so it is left for
+    // the next service() call rather than clocked with CS still low.
+    issue_ = ReadIssue::OversizeDrained;
+    ++stats_.oversizePayloads;
+
+    if (!drainWithinTransfer(length)) {
+      issue_ = ReadIssue::BodyFailed;
+      ++stats_.rxErrors;
+      return ShtpResult::BusError;
     }
-    if (log_) log_->log(LogLevel::Warn, LogShtp,
-                        "s%u oversize transfer %u > %u, drained", sensorId_,
-                        static_cast<unsigned>(length),
-                        static_cast<unsigned>(sizeof(rxTransfer_)));
     return ShtpResult::Oversize;
   }
 
-  if (!readRaw(rxTransfer_, length)) {
-    ++stats_.rxErrors;
-    if (log_) log_->log(LogLevel::Error, LogSpi, "s%u body transfer failed", sensorId_);
-    return ShtpResult::BusError;
+  const uint16_t payloadLen = static_cast<uint16_t>(length - shtp::kHeaderLen);
+
+  // Payload bytes, still inside the same CS assertion. `length` counts the
+  // header, and the header is already consumed, so exactly payloadLen remain.
+  if (payloadLen > 0) {
+    if (!hal_->read(rxTransfer_ + shtp::kHeaderLen, payloadLen)) {
+      issue_ = ReadIssue::BodyFailed;
+      ++stats_.rxErrors;
+      return ShtpResult::BusError;
+    }
   }
 
   ++stats_.packets;
@@ -216,28 +222,22 @@ ShtpResult ShtpTransport::service(uint32_t tEdgeUs) {
   stats_.lastLength = length;
   stats_.lastTimestampUs = tEdgeUs;
 
-  if (log_) log_->hex(LogLevel::Trace, LogShtp, "shtp-rx", rxTransfer_, length);
-
-  const uint16_t payloadLen = static_cast<uint16_t>(length - shtp::kHeaderLen);
-
   if (continuation) {
+    // The sender sets the continuation bit on every fragment after the first, so
+    // a continuation arriving with no assembly in progress is out of sequence.
     if (inRemaining_ == 0 || channel != inChannel_ || payloadLen > inRemaining_) {
+      issue_ = ReadIssue::UnexpectedContinuation;
       ++stats_.badFragments;
       inRemaining_ = 0;
       inCursor_ = 0;
-      if (log_) log_->log(LogLevel::Warn, LogShtp,
-                          "s%u unexpected continuation (ch=%u, %u bytes)", sensorId_,
-                          static_cast<unsigned>(channel),
-                          static_cast<unsigned>(payloadLen));
       return ShtpResult::Malformed;
     }
   } else {
     if (inRemaining_ != 0) {
       // A new payload started while an assembly was in progress.
+      issue_ = ReadIssue::InterruptedPayload;
+      extraValue_ = inRemaining_;
       ++stats_.badFragments;
-      if (log_) log_->log(LogLevel::Warn, LogShtp,
-                          "s%u interrupted payload (%u bytes lost)", sensorId_,
-                          static_cast<unsigned>(inRemaining_));
     }
     inCursor_ = 0;
     inChannel_ = channel;
@@ -248,13 +248,11 @@ ShtpResult ShtpTransport::service(uint32_t tEdgeUs) {
   if (payloadLen > 0) {
     const size_t space = static_cast<size_t>(sizeof(rxPayload_) - inCursor_);
     if (payloadLen > space) {
+      issue_ = ReadIssue::PayloadTooLarge;
+      extraValue_ = static_cast<uint32_t>(space);
       ++stats_.oversizePayloads;
       inRemaining_ = 0;
       inCursor_ = 0;
-      if (log_) log_->log(LogLevel::Error, LogShtp,
-                          "s%u payload %u exceeds buffer space %u", sensorId_,
-                          static_cast<unsigned>(payloadLen),
-                          static_cast<unsigned>(space));
       return ShtpResult::Oversize;
     }
     std::memcpy(rxPayload_ + inCursor_, rxTransfer_ + shtp::kHeaderLen, payloadLen);
@@ -266,16 +264,84 @@ ShtpResult ShtpTransport::service(uint32_t tEdgeUs) {
     return ShtpResult::Fragment;
   }
 
-  const uint16_t assembledLen = inCursor_;
-  const uint8_t assembledChannel = inChannel_;
-  const uint32_t assembledTime = inTimestampUs_;
+  assembledLength_ = inCursor_;
+  assembledChannel_ = inChannel_;
+  assembledTimestampUs_ = inTimestampUs_;
   inCursor_ = 0;
-
-  if (handler_ != nullptr) {
-    handler_(handlerContext_, assembledChannel, rxPayload_, assembledLen,
-             assembledTime);
-  }
+  deliver_ = true;
   return ShtpResult::Ok;
+}
+
+// All diagnostics for one service() call, emitted after CS has been released.
+void ShtpTransport::logRead(ShtpResult result) {
+  if (log_ == nullptr) return;
+
+  if (gapSeen_) {
+    gapSeen_ = false;
+    log_->log(LogLevel::Warn, LogShtp, "s%u ch%u seq gap: expected %u got %u",
+              sensorId_, static_cast<unsigned>(gapChannel_),
+              static_cast<unsigned>(gapExpected_),
+              static_cast<unsigned>(gapActual_));
+  }
+
+  switch (issue_) {
+    case ReadIssue::StartFailed:
+      log_->log(LogLevel::Error, LogSpi, "s%u read start failed", sensorId_);
+      return;
+    case ReadIssue::HeaderFailed:
+      log_->log(LogLevel::Error, LogSpi, "s%u header read failed", sensorId_);
+      return;
+    case ReadIssue::BodyFailed:
+      log_->log(LogLevel::Error, LogSpi, "s%u body read failed", sensorId_);
+      return;
+    case ReadIssue::Spurious:
+      log_->log(LogLevel::Debug, LogInt, "s%u spurious INT (len 0)", sensorId_);
+      return;
+    case ReadIssue::ReservedLength:
+      log_->log(LogLevel::Warn, LogShtp, "s%u reserved length 0xFFFF", sensorId_);
+      return;
+    case ReadIssue::ShortFragment:
+      log_->log(LogLevel::Warn, LogShtp, "s%u short fragment (%u)", sensorId_,
+                static_cast<unsigned>(hdrLength_));
+      return;
+    case ReadIssue::BadChannel:
+      log_->log(LogLevel::Warn, LogShtp, "s%u bad channel %u", sensorId_,
+                static_cast<unsigned>(hdrChannel_));
+      return;
+    case ReadIssue::UnexpectedContinuation:
+      log_->log(LogLevel::Warn, LogShtp,
+                "s%u unexpected continuation (ch=%u, %u bytes)", sensorId_,
+                static_cast<unsigned>(hdrChannel_),
+                static_cast<unsigned>(hdrLength_ - shtp::kHeaderLen));
+      return;
+    case ReadIssue::InterruptedPayload:
+      log_->log(LogLevel::Warn, LogShtp, "s%u interrupted payload (%u bytes lost)",
+                sensorId_, static_cast<unsigned>(extraValue_));
+      return;
+    case ReadIssue::OversizeDrained:
+      log_->log(LogLevel::Warn, LogShtp, "s%u oversize transfer %u > %u, drained",
+                sensorId_, static_cast<unsigned>(hdrLength_),
+                static_cast<unsigned>(sizeof(rxTransfer_)));
+      return;
+    case ReadIssue::PayloadTooLarge:
+      log_->log(LogLevel::Error, LogShtp, "s%u payload exceeds buffer space %u",
+                sensorId_, static_cast<unsigned>(extraValue_));
+      return;
+    case ReadIssue::None:
+      break;
+  }
+
+  if (!haveHeader_) return;
+
+  log_->log(LogLevel::Trace, LogShtp, "s%u hdr len=%u cont=%u ch=%u(%s) seq=%u",
+            sensorId_, static_cast<unsigned>(hdrLength_),
+            hdrContinuation_ ? 1u : 0u, static_cast<unsigned>(hdrChannel_),
+            shtp::channelName(hdrChannel_),
+            static_cast<unsigned>(hdrSequence_));
+
+  if (result == ShtpResult::Ok || result == ShtpResult::Fragment) {
+    log_->hex(LogLevel::Trace, LogShtp, "shtp-rx", rxTransfer_, hdrLength_);
+  }
 }
 
 bool ShtpTransport::send(uint8_t channel, const uint8_t* payload, uint16_t len) {

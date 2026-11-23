@@ -115,7 +115,7 @@ class Sensor {
 
   uint32_t stageDeadlineUs_;
   uint32_t nextAttemptUs_;
-  uint32_t bootPacketBaseline_;
+  uint32_t bootEpochBaseline_;
   bool setFeatureSent_;
   bool getFeatureSent_;
 

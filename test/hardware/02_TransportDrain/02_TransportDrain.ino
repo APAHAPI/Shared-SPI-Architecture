@@ -1,11 +1,17 @@
-// Phase 1 transport validation: the real ShtpTransport against a physical BNO085.
+// Phase 1 transport framing validation against a physical BNO085.
 //
-// Drives bno085::ShtpTransport::service() directly after a reset and checks that the
-// 552-byte channel-0 advertisement is consumed completely: no stranded tail, no
-// bogus fragments, and the device goes idle afterwards.
+// Drives bno085::ShtpTransport::service() directly after a reset and verifies the
+// corrected continuous-CS read: the 276-byte channel-0 advertisement (272-byte
+// payload) is delivered as one Ok packet, with no oversized transfer, no
+// fragments, no bus errors, one bus transaction per packet, and the device idle
+// afterwards.
 //
-// This is NOT stage 3: no SH-2 traffic, no product ID, no feature configuration. It
-// only exercises the fixed oversized-transfer drain path.
+// The old expectation that the advertisement is 552 B and must be drained is
+// invalid: 552 was a one-bit slip of 0x0114 caused by releasing CS between the
+// header and the body (and, on the first boot, by applying SPI_MODE3 after CS
+// was already low). The drain path is covered by the host suite.
+//
+// This is NOT stage 3: no SH-2 traffic, no product ID, no feature configuration.
 //
 // Wiring (Phase 1 baseline):
 //   SCK 12, MISO 13, MOSI 11, CS 10, INT 9, RST 8, 3V3 + GND, PS0/PS1 HIGH.
@@ -34,6 +40,8 @@ bno085::Esp32SpiHal hal(bus, &SPI, managerConfig, sensorConfig);
 bno085::ShtpTransport transport;
 
 static uint32_t handled = 0;
+static uint8_t firstHandledChannel = 0xFF;
+static uint16_t firstHandledLength = 0;
 static uint8_t lastHandledChannel = 0xFF;
 static uint16_t lastHandledLength = 0;
 
@@ -52,6 +60,10 @@ static const char* resultName(bno085::ShtpResult r) {
 
 static void onPayload(void*, uint8_t channel, const uint8_t* payload, uint16_t len,
                       uint32_t tUs) {
+  if (handled == 0) {
+    firstHandledChannel = channel;
+    firstHandledLength = len;
+  }
   ++handled;
   lastHandledChannel = channel;
   lastHandledLength = len;
@@ -75,7 +87,7 @@ void setup() {
   managerConfig.log = nullptr;
 
   Serial.println();
-  Serial.println("=== BNO085Multi transport drain validation ===");
+  Serial.println("=== BNO085Multi transport framing validation ===");
   Serial.printf("pins: SCK=%d MISO=%d MOSI=%d CS=%d INT=%d RST=%d clock=%luHz\r\n",
                 PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS, PIN_INT, PIN_RST,
                 static_cast<unsigned long>(SPI_HZ));
@@ -158,8 +170,10 @@ void setup() {
                 static_cast<unsigned>(s.badChannels),
                 static_cast<unsigned>(s.sequenceGaps),
                 static_cast<unsigned long>(s.rxErrors));
-  Serial.printf("payloads=%lu lastCh=%u lastLen=%u\r\n",
+  Serial.printf("payloads=%lu firstCh=%u firstLen=%u lastCh=%u lastLen=%u\r\n",
                 static_cast<unsigned long>(handled),
+                static_cast<unsigned>(firstHandledChannel),
+                static_cast<unsigned>(firstHandledLength),
                 static_cast<unsigned>(lastHandledChannel),
                 static_cast<unsigned>(lastHandledLength));
   Serial.printf("bus transactions=%lu lockTimeouts=%lu busErrors=%lu\r\n",
@@ -167,16 +181,23 @@ void setup() {
                 static_cast<unsigned long>(bus.lockTimeouts()),
                 static_cast<unsigned long>(bus.busErrors()));
 
-  const bool drained = (s.oversizePayloads >= 1);
+  // The corrected read presents the 276-byte advertisement as an ordinary
+  // packet: one Ok, channel 0, 272-byte payload. Nothing is oversized.
+  const bool framed = (okCalls >= 1 && firstHandledChannel == 0 &&
+                       firstHandledLength == 272);
+  const bool noOversize = (s.oversizePayloads == 0 && oversizeCalls == 0);
   const bool clean = (s.badFragments == 0 && s.shortFragments == 0 &&
                       s.badChannels == 0 && s.rxErrors == 0);
-  const bool pass = drained && clean && idle;
+  const bool oneCsPerPacket = (bus.transactions() == calls);
+  const bool pass = framed && noOversize && clean && idle && oneCsPerPacket;
 
-  if (!drained) Serial.println("  MISSING: no oversized transfer seen");
+  if (!framed) Serial.println("  MISSING: first payload is not the 272-byte channel-0 advertisement");
+  if (!noOversize) Serial.println("  UNEXPECTED: an oversized transfer was seen");
   if (!clean) Serial.println("  DESYNC: fragment/channel/bus error counters non-zero");
-  if (!idle) Serial.println("  DESYNC: device still presenting data after the drain");
+  if (!idle) Serial.println("  DESYNC: device still presenting data after the boot burst");
+  if (!oneCsPerPacket) Serial.println("  FRAMING: bus transactions do not match packets read");
 
-  Serial.println(pass ? "RESULT: PASS - oversized transfer fully drained, stream idle"
+  Serial.println(pass ? "RESULT: PASS - 276-byte advertisement, one CS assertion per packet, stream idle"
                       : "RESULT: FAIL");
 }
 

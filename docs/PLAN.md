@@ -154,13 +154,16 @@ Updated after Phase 1. See `PHASE1-NOTES.md` for evidence and the open items.
 
 - **Compiled:** `esp32:esp32:esp32s3` (ESP32 Arduino core 3.3.12), example and
   diagnostic sketch, no warnings with `--warnings all`.
-- **Unit tested:** 54 host cases / 348 checks, 0 failures (MSVC 2022), including bounded
-  automatic recovery, output loss accounting and polling timestamp semantics.
+- **Unit tested:** 61 host cases / 438 checks, 0 failures (MSVC 2022), including
+  continuous-CS framing, bounded automatic recovery, output loss accounting and
+  polling timestamp semantics.
 - **Simulated:** single mock device only; no 20-instance simulation yet.
-- **Hardware validated:** stages 1–2 (bus, CS, SHTP framing, boot 93.7 ms) and the
-  oversized-transfer drain (552 B advertisement consumed in 4 bus transactions, stream
-  returns to idle). Product ID, Rotation Vector configuration and streaming are still
-  open.
+- **Hardware validated:** stages 1–2 (bus, CS, SHTP framing, boot 93.9 ms) with the
+  continuous-CS read: the 276 B channel-0 advertisement (272 B payload) is read in one
+  CS assertion and the stream returns to idle. The earlier "552 B advertisement" result
+  was a one-bit slip and is invalid. Product ID, Rotation Vector configuration and
+  streaming are still open; Product ID is currently blocked because PS0/WAKE is tied
+  HIGH instead of wired to a GPIO.
 
 Every remaining performance number in RESOURCE-ANALYSIS.md is still a calculation with
 stated assumptions until the corresponding hardware stage runs.
