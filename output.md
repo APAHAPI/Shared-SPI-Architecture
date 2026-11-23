@@ -11,13 +11,19 @@ This document is a fresh audit of the current tree. Earlier statements about
 "Pass 4 uncommitted" are obsolete: Pass 5A was committed at `d9fa757` and the tree was
 clean before Pass 6. Nothing here is staged, committed, amended or pushed.
 
+> **Update (2026-11-24).** The audit body below was written at `d9fa757`. The evidence
+> and verification sections have been refreshed for the current tree: HEAD `f0f228a`
+> ("Fix continuous-CS BNO085 reads"), with only `output.md` left modified. The Pass 6
+> findings themselves are unchanged. Current physical evidence and the Stage 1 blocker
+> are in [hardware_test_report.md](hardware_test_report.md).
+
 Status tags used below:
 
 - **source-inspected** — read in the current tree, reasoning only.
 - **host-tested** — executed by `test/native` on the host PC with mock hardware.
 - **compiled** — built for `esp32:esp32:esp32s3`; not executed.
-- **hardware-verified** — previously measured on the physical ESP32-S3 + BNO085.
-  *Pass 6 added no hardware evidence.*
+- **hardware-verified** — measured on the physical ESP32-S3 + BNO085. Pass 6 itself
+  added no hardware evidence; the 2026-11-24 update adds the read-framing result.
 
 ---
 
@@ -45,24 +51,30 @@ The cross-system review (6D) found and fixed one real ordering defect introduced
 smaller coherence/observability defects. The remaining unfixed observations are listed
 in §8 and are outside the 6A–6C scope.
 
-**Hardware status is unchanged: no physical validation was performed in Pass 6.**
+**Hardware status in Pass 6: no physical validation was performed.** The 2026-11-24
+update adds the read-framing result; Stage 1 is still blocked at Product ID (see §2 and
+`hardware_test_report.md`).
 
 ---
 
-## 2. Evidence collected
+## 2. Evidence collected (current tree)
 
 | Evidence | Result |
 | --- | --- |
-| `git rev-parse HEAD` | `d9fa757374c9f0e640a6559c725026a61f680d79` |
+| `git rev-parse HEAD` | `f0f228a` ("Fix continuous-CS BNO085 reads"); only `output.md` is modified |
 | `git branch --show-current` | `main` |
-| `git status --short` | 19 modified tracked files (see §7) |
-| Host suite | **54 cases / 348 checks, 0 failures** |
-| ESP32-S3 example build | **326 142 B flash (24 %), 23 968 B RAM (7 %)**, `--warnings all`, no warnings |
-| Hardware | **Not available in this pass** (ESP32-S3 and BNO085 disconnected, COM11 unavailable) |
+| `git status --short` | 1 modified tracked file (`output.md`); the read-framing fix is committed as `f0f228a` |
+| Host suite | **61 cases / 438 checks, 0 failures**; `cl /analyze` 0 warnings |
+| ESP32-S3 example build | **326 806 B flash (24 %), 24 640 B RAM (7 %)**, `--warnings all`, no warnings |
+| Hardware | Continuous-CS read fix verified on COM11: 276 B advertisement in one CS assertion; Stage 1 blocked at Product ID (PS0/WAKE not wired to a GPIO) |
 
 Source-inspected but not hardware-tested: real UART/USB backpressure, actual INT
-observation lag, real boot/backoff durations, NRST and SHTP-reset behaviour, and a PC
-parser consuming the sequence gaps.
+observation lag, real boot/backoff durations, and a PC parser consuming the sequence
+gaps. NRST reset was exercised on the bench; SHTP software reset acceptance is
+unverified because host writes are blocked by the PS0/WAKE wiring.
+
+Pass 6 ran 54 cases / 348 checks and built 326 142 B flash / 23 968 B RAM. Those numbers
+are historical; the table above is the current tree.
 
 ---
 
@@ -341,20 +353,23 @@ No file was deleted. No history was modified.
 
 ---
 
-## 8. Exact verification
+## 8. Exact verification (current tree)
 
 Host suite:
 
 ```
-> cd "C:\Users\Apahapi\Desktop\Source codes\Shared SPI Architecture"
-> cmd /c "test\native\build_msvc.bat"
-BNO085Multi host tests (54 cases)
-...
-348 checks, 0 failures
+> test\native\build_msvc.bat
+61 cases, 438 checks, 0 failures
 RESULT: PASS
 ```
 
-The new cases are:
+MSVC `/W4` produced no warnings. Static analysis (`cl /analyze` over the portable core,
+`build\analyze_msvc.bat`): 0 warnings, 0 errors, exit 0. AddressSanitizer could not be
+linked in this MSVC installation (`LNK1104: cannot open file
+'clang_rt.asan_static_runtime_thunk-x86_64.lib'`), so the suite was not run under ASan.
+
+The Pass 6 host output was `BNO085Multi host tests (54 cases)` / `348 checks, 0
+failures`. The Pass 6 cases were:
 
 ```
 encoder_output_outcomes
@@ -373,28 +388,26 @@ sensor_observation_timestamp
 (`sensor_boot_timeout` existed but its expectation changed from terminal `Failed` to
 recoverable `Recovering`.)
 
-ESP32-S3 example build:
+Current ESP32-S3 example build:
 
 ```
-> & "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
-    compile --fqbn esp32:esp32:esp32s3 --library . `
-    --build-path build\esp32s3 --warnings all examples\01_SingleSensor
-Sketch uses 326142 bytes (24%) of program storage space.
-Global variables use 23968 bytes (7%) of dynamic memory.
+> arduino-cli compile --fqbn esp32:esp32:esp32s3 --library . `
+    --build-path build\stage1-final3 --warnings all examples\01_SingleSensor
+Sketch uses 326806 bytes (24%) of program storage space.
+Global variables use 24640 bytes (7%) of dynamic memory.
 ```
 
-No compiler warnings or errors were emitted. This is a compile result, not a hardware
-result.
-
-Static analysis: no separate analyser is configured in this repository. MSVC `/W4`
-(the build uses `/W4 /WX-`) produced no warnings, and `--warnings all` produced none.
+No compiler warnings or errors were emitted. This is a compile result; the physical
+result is in `hardware_test_report.md`.
 
 ---
 
 ## 9. Limitations and assumptions
 
-1. **No hardware evidence in Pass 6.** All recovery, output and timestamp behaviour above
-   is source-inspected and host-tested only.
+1. **Pass 6 had no hardware evidence.** The recovery, output and timestamp behaviour
+   described above is source-inspected and host-tested only. The later continuous-CS
+   read fix does have physical evidence, but Product ID and streaming are still blocked
+   by the PS0/WAKE wiring.
 2. **Sink honesty.** The atomic-drop guarantee depends on `availableForWrite()` being
    truthful. A sink that over-reports can still produce a partial frame; the counters make
    it visible, and the receiver resynchronises on `A5 5A` + CRC.
@@ -414,7 +427,11 @@ Static analysis: no separate analyser is configured in this repository. MSVC `/W
 
 The following remain open before Phase 1 can be called physically complete:
 
-1. Product ID retrieval, Rotation Vector configuration and granted interval.
+1. Product ID retrieval, Rotation Vector configuration and granted interval. Read framing
+   is now verified on hardware: the 276 B advertisement is read in one CS assertion.
+   Product ID is **blocked** because PS0/WAKE is tied HIGH instead of wired to a GPIO
+   (`product=0x00000000`, `sh2-timeout`). A probe that wrote F9 while the hub asserted
+   INT received the real `0xF8` responses, so the read path, MOSI and decoder are healthy.
 2. Continuous quaternion decode and accuracy bits at 100 Hz.
 3. A 10-minute soak with zero CRC/frame errors and zero unexplained sequence gaps.
 4. Disconnected INT: reach `Degraded`, start recovery after the silence dwell, never hang.
@@ -431,4 +448,5 @@ The following remain open before Phase 1 can be called physically complete:
 
 After the hardware items in §10, Phase 2 can start: a `Manager` that owns the bus and
 schedules several `Sensor` instances round-robin, with per-sensor recovery and the
-existing single-sensor API preserved. No Phase 2 work was started in this pass.
+existing single-sensor API preserved. No Phase 2 work was started in this pass. Stage 1
+remains blocked at Product ID, so Phase 2 has not started.
