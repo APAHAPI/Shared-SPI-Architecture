@@ -16,10 +16,10 @@
 // Serial instead of human-readable lines. The two must not be mixed on one
 // port: text would corrupt the frames.
 //
-// This sketch is the Phase 1 acceptance sketch. It has been run on the Stage 1
-// bench (ESP32-S3 + BNO085 on COM11): the 276-byte advertisement and reset-complete
-// read correctly, but Product ID is blocked until PS0/WAKE is wired to a GPIO.
-// See hardware_test_report.md.
+// This sketch is the Phase 1 acceptance sketch. On the Stage 2 bench
+// (ESP32-S3 + BNO085 on COM11, PS0/WAKE on GPIO14) it reads the 276-byte
+// advertisement, identifies the part, configures Rotation Vector at 100 Hz and
+// streams quaternions. See hardware_test_report.md.
 //
 // Timestamp diagnostic (`dt=` on each RV line):
 //   dt = tHost - tMeas, printed as a signed value. It is the interval between
@@ -42,7 +42,7 @@
 #define BNO085_CS_PIN 10
 #define BNO085_INT_PIN 9
 #define BNO085_RESET_PIN 8
-#define BNO085_WAKE_PIN -1  // PS0/WAKE: wire to a GPIO for SPI; -1 skips wake
+#define BNO085_WAKE_PIN 14  // PS0/WAKE on GPIO14; -1 if not wired
 
 #define BNO085_SPI_HZ 1000000  // raise to 3000000 once the wiring is proven
 

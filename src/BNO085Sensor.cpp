@@ -6,6 +6,10 @@ namespace bno085 {
 
 namespace {
 constexpr uint32_t kRetryIntervalUs = 10000;  // re-send cadence while identifying
+// The hub emits its Get Feature Response only after the new report period has
+// been applied. Measured on the bench at ~120 ms when the RV starts at 100 Hz,
+// so the command timeout (100 ms) is not enough for this exchange.
+constexpr uint32_t kFeatureApplyTimeoutUs = 250000;
 constexpr uint32_t kSilenceGraceUs = 50000;
 constexpr uint32_t kSilenceFactor = 5;  // 2.5 intervals expressed as 5/2
 } // namespace
@@ -15,7 +19,7 @@ Sensor::Sensor(IHal& hal)
       manager_(), cfg_(), diag_(), latest_(), newData_(false), started_(false),
       state_(State::Unconfigured), stage_(StageIdle), index_(0),
       stageDeadlineUs_(0), nextAttemptUs_(0), bootEpochBaseline_(0),
-      setFeatureSent_(false), getFeatureSent_(false), intPending_(false),
+      setFeatureSent_(false), intPending_(false),
       intEdgeUs_(0), lastStatusUs_(0), lastReportUs_(0), retryAtUs_(0),
       recovering_(false), recoveryAttempts_(0),
       lastManualRecoverUs_(0), manualRecoverUsed_(false),
@@ -147,7 +151,6 @@ void Sensor::startBoot() {
   // and then times out.
   bootEpochBaseline_ = sh2_.epoch();
   setFeatureSent_ = false;
-  getFeatureSent_ = false;
   intPending_ = false;
   consecutiveBusErrors_ = 0;
   consecutiveProtocolErrors_ = 0;
@@ -318,6 +321,7 @@ void Sensor::advanceInit(uint32_t nowUs) {
 
     case StageIdentify:
       if (sh2_.productInfo().valid) {
+        diag_.product = sh2_.productInfo();
         stage_ = StageSetFeature;
         setState(State::Configuring);
         diag_.initStage = static_cast<uint8_t>(stage_);
@@ -340,15 +344,21 @@ void Sensor::advanceInit(uint32_t nowUs) {
                                          cfg_.intervalUs, nowUs);
         if (!setFeatureSent_) {
           nextAttemptUs_ = nowUs + kRetryIntervalUs;
+        } else {
+          // The hub answers a Set Feature with a Get Feature Response once the
+          // new period is applied (datasheet 1.3.5). An explicit request sent
+          // immediately after the Set Feature is answered from the old config
+          // (a zero interval), so wait for the hub's own response instead.
+          sh2_.expectFeatureResponse(static_cast<uint8_t>(Report::RotationVector),
+                                     nowUs, kFeatureApplyTimeoutUs);
         }
         break;
       }
       if (sh2_.cmdState() == Sh2Client::CmdState::Ok) {
         stage_ = StageGetFeature;
         diag_.initStage = static_cast<uint8_t>(stage_);
-        stageDeadlineUs_ = nowUs + commandTimeoutUs();
+        stageDeadlineUs_ = nowUs + kFeatureApplyTimeoutUs;
         nextAttemptUs_ = nowUs;
-        getFeatureSent_ = false;
       } else if (sh2_.cmdState() == Sh2Client::CmdState::HubError) {
         failRecoverable(ErrorCode::Sh2BadResponse);
       } else if (sh2_.cmdState() == Sh2Client::CmdState::Timeout) {
@@ -356,6 +366,10 @@ void Sensor::advanceInit(uint32_t nowUs) {
       } else if (!sh2_.busy() && reached(nowUs, nextAttemptUs_)) {
         setFeatureSent_ = sh2_.setFeature(
             static_cast<uint8_t>(Report::RotationVector), cfg_.intervalUs, nowUs);
+        if (setFeatureSent_) {
+          sh2_.expectFeatureResponse(static_cast<uint8_t>(Report::RotationVector),
+                                     nowUs, kFeatureApplyTimeoutUs);
+        }
         nextAttemptUs_ = nowUs + kRetryIntervalUs;
       } else if (reached(nowUs, stageDeadlineUs_)) {
         failRecoverable(ErrorCode::Sh2Timeout);
@@ -363,17 +377,6 @@ void Sensor::advanceInit(uint32_t nowUs) {
       break;
 
     case StageGetFeature:
-      if (!getFeatureSent_) {
-        if (reached(nowUs, nextAttemptUs_)) {
-          getFeatureSent_ = sh2_.getFeature(
-              static_cast<uint8_t>(Report::RotationVector), nowUs);
-          nextAttemptUs_ = nowUs + kRetryIntervalUs;
-        }
-        if (!getFeatureSent_ && reached(nowUs, stageDeadlineUs_)) {
-          failRecoverable(ErrorCode::Sh2Timeout);
-        }
-        break;
-      }
       if (sh2_.featureState() == Sh2Client::CmdState::Ok) {
         enterStreaming();
       } else if (sh2_.featureState() == Sh2Client::CmdState::HubError) {
@@ -582,7 +585,6 @@ void Sensor::onResetComplete() {
   setState(State::Configuring);
   diag_.initStage = static_cast<uint8_t>(stage_);
   setFeatureSent_ = false;
-  getFeatureSent_ = false;
   stageDeadlineUs_ = hal_.timeUs() + commandTimeoutUs();
   nextAttemptUs_ = hal_.timeUs();
 }
@@ -705,6 +707,14 @@ void Sensor::scheduleRecovery(ErrorCode reason, bool manual) {
 
 void Sensor::failRecoverable(ErrorCode code) {
   if (diag_.recoveryFailures < 0xFFFFu) ++diag_.recoveryFailures;
+  if (log_.enabled(LogLevel::Info, LogInit)) {
+    log_.log(LogLevel::Info, LogInit,
+             "s%u recoverable error stage=%u cmd=%u feat=%u setSent=%u busy=%u",
+             index_, static_cast<unsigned>(stage_),
+             static_cast<unsigned>(sh2_.cmdState()),
+             static_cast<unsigned>(sh2_.featureState()),
+             setFeatureSent_ ? 1u : 0u, sh2_.busy() ? 1u : 0u);
+  }
   if (!manager_.recovery.autoRecover) {
     enterTerminalFailed(code);
     return;

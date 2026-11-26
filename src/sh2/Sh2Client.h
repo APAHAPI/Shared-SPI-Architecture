@@ -61,6 +61,9 @@ class Sh2Client {
 
   bool requestProductIds(uint32_t nowUs);
   bool setFeature(uint8_t reportId, uint32_t intervalUs, uint32_t nowUs);
+  // Arm the wait for the Get Feature Response the hub emits once it has applied
+  // a Set Feature (datasheet 1.3.5). No request is sent.
+  bool expectFeatureResponse(uint8_t reportId, uint32_t nowUs, uint32_t windowUs);
   bool getFeature(uint8_t reportId, uint32_t nowUs);
   bool sendReset();
 

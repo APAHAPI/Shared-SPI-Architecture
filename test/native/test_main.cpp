@@ -243,8 +243,9 @@ void driveSensorToStreaming(SensorFixture& fx) {
 
   fx.sensor.update();  // set-feature (completes on send)
   fx.sensor.update();  // -> StageGetFeature
-  fx.sensor.update();  // get-feature request
 
+  // The hub emits the Get Feature Response itself once the new period is
+  // applied; the host does not request it.
   fx.hal.queuePacket(makePacket(2, 1, makeGetFeatureResponse(0x05, 10000)));
   fx.sensor.update();
   CHECK(fx.sensor.state() == bno085::State::Streaming);
@@ -261,7 +262,6 @@ void finishBootToStreaming(SensorFixture& fx) {
   fx.sensor.update();
   CHECK(fx.sensor.state() == bno085::State::Configuring);
 
-  fx.sensor.update();
   fx.sensor.update();
   fx.sensor.update();
 
@@ -792,6 +792,32 @@ void testSh2SetFeatureBytes() {
   CHECK(fx.hal.sent.back() == expectedSecond);
 }
 
+void testSh2ExpectFeatureResponse() {
+  Sh2Fixture fx;
+  CHECK(fx.sh2.expectFeatureResponse(0x05, 1000, 250000));
+  CHECK(fx.hal.sent.empty());  // waiting, not requesting
+  CHECK(fx.sh2.busy());
+  CHECK(fx.sh2.featureState() == bno085::Sh2Client::CmdState::Pending);
+
+  std::vector<uint8_t> response = makeGetFeatureResponse(0x05, 10000);
+  fx.sh2.handlePayload(2, response.data(),
+                       static_cast<uint16_t>(response.size()), 2000);
+  CHECK(fx.sh2.featureState() == bno085::Sh2Client::CmdState::Ok);
+  CHECK(fx.sh2.grantedIntervalUs() == 10000);
+  CHECK(!fx.sh2.busy());
+}
+
+void testSh2ExpectFeatureResponseTimeout() {
+  Sh2Fixture fx;
+  CHECK(fx.sh2.expectFeatureResponse(0x05, 1000, 5000));
+  fx.sh2.pollTimeouts(5999);
+  CHECK(fx.sh2.featureState() == bno085::Sh2Client::CmdState::Pending);
+  fx.sh2.pollTimeouts(6000);
+  CHECK(fx.sh2.featureState() == bno085::Sh2Client::CmdState::Timeout);
+  CHECK(!fx.sh2.busy());
+  CHECK(fx.sh2.stats().timeouts == 1);
+}
+
 void testSh2RotationVectorDecode() {
   Sh2Fixture fx;
   const std::vector<uint8_t> report =
@@ -1100,9 +1126,9 @@ void testSensorInitializationSequence() {
   fx.sensor.update();
   CHECK(fx.sensor.state() == bno085::State::Configuring);
 
-  fx.sensor.update();  // sends get-feature
-  CHECK(fx.hal.sent.size() == 3);
-  CHECK(fx.hal.sent[2][4] == bno085::sh2::kGetFeatureReq);
+  // The host waits for the hub's own Get Feature Response; it must not send a
+  // second request whose answer would still describe the old configuration.
+  CHECK(fx.hal.sent.size() == 2);
 
   fx.hal.queuePacket(makePacket(2, 1, makeGetFeatureResponse(0x05, 10000)));
   fx.sensor.update();
@@ -1447,6 +1473,8 @@ int main() {
       {"shtp_continuation_fragment_clean", testShtpContinuationFragmentRejectedCleanly},
       {"sh2_product_id", testSh2ProductId},
       {"sh2_set_feature_bytes", testSh2SetFeatureBytes},
+      {"sh2_expect_feature_response", testSh2ExpectFeatureResponse},
+      {"sh2_expect_feature_timeout", testSh2ExpectFeatureResponseTimeout},
       {"sh2_rotation_vector_decode", testSh2RotationVectorDecode},
       {"sh2_delay_field", testSh2DelayField},
       {"sh2_duplicate_suppression", testSh2DuplicateSuppression},

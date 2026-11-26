@@ -3,7 +3,9 @@
 namespace bno085 {
 
 namespace {
-constexpr uint32_t kWakePulseUs = 200;   // datasheet: twk typ 150 us
+// Datasheet twk is 150 us typical. Hold WAKE low while waiting for INT instead
+// of a fixed-length pulse: the hub asserts INT when it is awake, and a pulse
+// that ends before that point is simply ignored.
 constexpr uint32_t kWakeWaitUs = 2000;   // bounded wait for INT after wake
 constexpr uint16_t kResetLowUs = 10;     // datasheet minimum is 10 ns
 constexpr uint16_t kResetHoldMs = 1;
@@ -20,6 +22,13 @@ Esp32SpiHal::Esp32SpiHal(SpiBusManager& bus, SPIClass* spi,
 }
 
 Status Esp32SpiHal::begin() {
+  // The HAL object is normally constructed before setup() fills the manager
+  // config, so the constructor saw a null sink. Bind the logger here, once the
+  // caller's configuration (and its sink) is final.
+  log_.attach(manager_->log);
+  log_.setLevel(manager_->logLevel);
+  log_.setCategories(manager_->logCategories);
+
   const Status busStatus =
       bus_.begin(spi_, manager_->sckPin, manager_->misoPin, manager_->mosiPin,
                  manager_->spiHz, manager_->busTimeoutUs);
@@ -141,21 +150,40 @@ bool Esp32SpiHal::intAsserted() {
 
 bool Esp32SpiHal::prepareWrite() {
   if (config_->wakePin < 0) return true;
-  if (intAsserted()) return true;
+  if (intAsserted()) {
+    if (log_.enabled(LogLevel::Info, LogSpi)) {
+      log_.log(LogLevel::Info, LogSpi, "write: INT already low, no wake pulse");
+    }
+    return true;
+  }
 
   digitalWrite(config_->wakePin, LOW);
-  delayMicroseconds(kWakePulseUs);
-  digitalWrite(config_->wakePin, HIGH);
+  // Read the pad back while it is driven low. A pad still reading high is tied
+  // to 3V3 somewhere else and the wake request cannot reach the device.
+  const int readback = digitalRead(config_->wakePin);
 
   const uint32_t start = micros();
   while (static_cast<uint32_t>(micros() - start) < kWakeWaitUs) {
-    if (intAsserted()) return true;
+    if (intAsserted()) {
+      const uint32_t waited = micros() - start;
+      digitalWrite(config_->wakePin, HIGH);
+      if (log_.enabled(LogLevel::Debug, LogSpi)) {
+        log_.log(LogLevel::Debug, LogSpi, "wake: INT after %luus (pad=%d)",
+                 static_cast<unsigned long>(waited), readback);
+      }
+      return true;
+    }
   }
 
+  digitalWrite(config_->wakePin, HIGH);
   // The write is still attempted: several hosts succeed without WAKE.
   if (log_.enabled(LogLevel::Warn, LogSpi)) {
-    log_.log(LogLevel::Warn, LogSpi, "wake pulse did not assert INT within %uus",
-             static_cast<unsigned>(kWakeWaitUs));
+    // pad readback = 1 while driven low means something else still holds the
+    // line at 3V3, so the wake request never reaches the device.
+    log_.log(LogLevel::Warn, LogSpi,
+             "wake: no INT within %uus (pad readback while low=%d, pin %d)",
+             static_cast<unsigned>(kWakeWaitUs), readback,
+             static_cast<int>(config_->wakePin));
   }
   return true;
 }

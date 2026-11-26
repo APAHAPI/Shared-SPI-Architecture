@@ -240,9 +240,13 @@ void Sh2Client::handleGetFeatureResponse(const uint8_t* report) {
   featurePending_ = false;
   featureState_ = CmdState::Ok;
   if (log_) {
-    log_->log(LogLevel::Info, LogSh2, "s%u report 0x%02X granted interval %lu us",
+    log_->hex(LogLevel::Info, LogSh2, "get-feature", report,
+              sh2::kGetFeatureRespLen);
+    log_->log(LogLevel::Info, LogSh2,
+              "s%u report 0x%02X granted interval %lu us (flags=0x%02X)",
               sensorId_, static_cast<unsigned>(featureId_),
-              static_cast<unsigned long>(grantedIntervalUs_));
+              static_cast<unsigned long>(grantedIntervalUs_),
+              static_cast<unsigned>(report[2]));
   }
 }
 
@@ -426,9 +430,24 @@ bool Sh2Client::setFeature(uint8_t reportId, uint32_t intervalUs, uint32_t nowUs
   (void)nowUs;
 
   if (log_) {
+    log_->hex(LogLevel::Info, LogSh2, "set-feature-tx", payload, sizeof(payload));
     log_->log(LogLevel::Info, LogSh2, "s%u -> set feature 0x%02X @ %lu us", sensorId_,
               static_cast<unsigned>(reportId),
               static_cast<unsigned long>(intervalUs));
+  }
+  return true;
+}
+
+bool Sh2Client::expectFeatureResponse(uint8_t reportId, uint32_t nowUs,
+                                      uint32_t windowUs) {
+  if (transport_ == nullptr) return false;
+  featurePending_ = true;
+  featureId_ = reportId;
+  featureDeadlineUs_ = nowUs + windowUs;
+  featureState_ = CmdState::Pending;
+  if (log_) {
+    log_->log(LogLevel::Info, LogSh2, "s%u waiting for get-feature response 0x%02X",
+              sensorId_, static_cast<unsigned>(reportId));
   }
   return true;
 }
@@ -444,7 +463,7 @@ bool Sh2Client::getFeature(uint8_t reportId, uint32_t nowUs) {
   featureDeadlineUs_ = nowUs + timeoutUs();
   featureState_ = CmdState::Pending;
   if (log_) {
-    log_->log(LogLevel::Debug, LogSh2, "s%u -> get feature 0x%02X", sensorId_,
+    log_->log(LogLevel::Info, LogSh2, "s%u -> get feature 0x%02X", sensorId_,
               static_cast<unsigned>(reportId));
   }
   return true;
@@ -493,9 +512,8 @@ void Sh2Client::pollTimeouts(uint32_t nowUs) {
     lastError_ = ErrorCode::Sh2Timeout;
     if (log_) {
       log_->log(LogLevel::Error, LogSh2,
-                "s%u get-feature 0x%02X timed out after %u ms", sensorId_,
-                static_cast<unsigned>(featureId_),
-                static_cast<unsigned>(timeoutMs_));
+                "s%u get-feature 0x%02X response timed out", sensorId_,
+                static_cast<unsigned>(featureId_));
     }
   }
 }
