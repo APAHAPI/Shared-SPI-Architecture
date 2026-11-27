@@ -2,14 +2,16 @@
 
 **Initial run:** 2026-11-20
 **Post-fix verification:** 2026-11-23
-**Stage 2 WAKE validation:** 2026-11-26, HEAD `2e9a2d8` plus the uncommitted WAKE/init changes; PS0/WAKE on GPIO14
+**Stage 2 WAKE validation:** 2026-11-26, HEAD `2e9a2d8` plus the then-uncommitted WAKE/init changes; PS0/WAKE on GPIO14
+**Stage 2 A-F re-validation:** 2026-11-27, HEAD `fe284f3` plus two logging-only changes; PS0/WAKE on GPIO14
 **Board:** ESP32-S3 (QFN56, rev v0.2, 8 MB PSRAM), MAC `94:a9:90:d3:5a:b8`
 **Sensor:** one BNO085 on SPI, COM11 (CH343 USB-UART bridge). The physical module is an
 Adafruit 9-DOF BNO085 breakout (README hardware baseline).
 **Repository:** `Shared SPI Architecture`, branch `main`. The Stage 1 run was made at
 HEAD `7227135` with the framing fix uncommitted; that fix is now committed as `f0f228a`.
-Stage 2 ran at HEAD `2e9a2d8` with the WAKE and initialization changes uncommitted
-(section 13).
+Stage 2 first ran at HEAD `2e9a2d8` with the WAKE and initialization changes uncommitted;
+those changes are now committed as `fe284f3`. The A-F re-validation in section 13.4
+re-ran the physical sequence on that commit.
 **Firmware under test:** `examples/01_SingleSensor`, `esp32:esp32:esp32s3`, ESP32 core 3.3.12, SPI mode 3 at 1 MHz, pins SCK 12 / MISO 13 / MOSI 11 / CS 10 / INT 9 / RST 8 / WAKE 14.
 
 ---
@@ -17,7 +19,7 @@ Stage 2 ran at HEAD `2e9a2d8` with the WAKE and initialization changes uncommitt
 ## 1. Verdict
 
 **Read-framing defect: FIXED and verified on hardware.**
-**Stage 1 acceptance: PASSED on the Stage 2 bench (2026-11-26).**
+**Stage 1 acceptance: PASSED on the Stage 2 bench; re-validated A-F on 2026-11-27 (sections 13.4-13.9).**
 
 | Result | Evidence |
 |---|---|
@@ -27,10 +29,10 @@ Stage 2 ran at HEAD `2e9a2d8` with the WAKE and initialization changes uncommitt
 | PASS - Product ID | `part=10004148 build=6 fw=3.2.13 resetCause=4`, first boot |
 | PASS - SH-2 initialization | begin to streaming in 315 ms, one pass, no recovery |
 | PASS - Rotation Vector configuration | set 10 000 us, hub granted 10 000 us |
-| PASS - live quaternions | 1737 reports / 17.42 s = 99.65 Hz overall, 99.82 Hz steady; all quaternions finite |
+| PASS - live quaternions | 1738 reports / 17.432 s = 99.65 Hz overall, 99.82 Hz steady; all quaternions finite |
 | PASS - transport health | `spiErrors=0 busTimeouts=0 badFrag=0 oversize=0 seqGaps=0 spurious=0 sh2Timeouts=0` |
 | PASS - host suite and static analysis | 63 cases / 449 checks, 0 failures; `/analyze` 0 warnings |
-| PASS - ESP32-S3 compilation | 327 206 B flash (24 %), 24 640 B static RAM (7 %), no warnings with `--warnings all` |
+| PASS - ESP32-S3 compilation | 327 274 B flash (24 %), 24 640 B static RAM (7 %), no warnings with `--warnings all` |
 | OBSERVATION - RV accuracy | `acc=unreliable` for the whole stationary run; quaternion is finite and stable, motion/calibration not tested |
 
 The Stage 1 diagnosis was correct: with PS0 tied HIGH the hub accepts a write only
@@ -477,23 +479,23 @@ No firmware change can substitute for the missing GPIO connection. A "write only
 
 ---
 
-## 13. Stage 2 WAKE validation (2026-11-26)
+## 13. Stage 2 WAKE validation (2026-11-26) and A-F re-validation (2026-11-27)
 
 ### 13.1 Result
 
-**PASS - Stage 1 acceptance completed on the Stage 2 bench.**
+**PASS - Stage 1 acceptance completed on the Stage 2 bench and re-validated A-F.**
 
 Moving PS0/WAKE from the 3.3 V tie to GPIO14 removed the write-path blocker. The
-first cold boot after the final flash completed the whole bring-up in one pass:
-`s0 begin` at 281 ms, reset-complete at 444 ms, Product ID at 454 ms, set-feature
-at 465 ms, the hub's automatic get-feature response at 590 ms, and streaming at
-596 ms. No recovery was used (`resets=1`, `recovery attempts=0`). Rotation Vector
-then streamed at 99.65 Hz overall (99.82 Hz in the steady window) with finite
+A-F cold boot on `fe284f3` completed the whole bring-up in one pass: `s0 begin` at
+266 ms, reset-complete at 428 ms, Product ID at 439 ms, set-feature at 456 ms, the
+hub's automatic get-feature response at 575 ms, and streaming at 581 ms. No
+recovery was used (`resets=1`, `recovery attempts=0`). Rotation Vector then
+streamed at 99.65 Hz overall (99.82 Hz in the steady window) with finite
 quaternions and zero transport errors.
 
 Two firmware defects surfaced only with the wire in place and were fixed before
 this result: the fixed-length wake pulse, and the stale get-feature readback.
-Section 13.3 describes both.
+Section 13.3 describes both. Section 13.11 records the earlier bring-up run.
 
 ### 13.2 Wiring and electrical configuration
 
@@ -556,24 +558,35 @@ final. This is what made the wake failures visible at all.
 from `Sh2Client::productInfo()` as soon as identification completes.
 
 HAL logging in the final build is `LogLevel::Info` with the normal
-`Reset|Init|Int|Sh2|Data|Shtp|Spi` categories; per-wake timing is Debug, and the
-only wake warning is the failure case.
+`Reset|Init|Int|Sh2|Data|Shtp|Spi` categories; per-wake timing is one Info line per
+host write, and the only wake warning is the failure case.
 
 ### 13.4 Firmware identity, build and flash
 
 | Item | Value |
 |---|---|
-| Repository | branch `main`, HEAD `2e9a2d8`, eight modified files (section 14), nothing staged or committed |
+| Repository | branch `main`, HEAD `fe284f3cd09ed30e90cea7b312a24d181a634ea5` ("Fix BNO085 WAKE and feature initialization"), three modified files |
+| Working tree | `src/hal/Esp32SpiHal.cpp` and `src/sh2/Sh2Client.cpp` contain Info-level evidence lines only, no behavioural change; this report is updated; nothing staged or committed |
 | Sketch | `examples/01_SingleSensor` |
 | FQBN | `esp32:esp32:esp32s3` (ESP32 core 3.3.12) |
-| Build | `build/stage2-final`, `BNO085_LOG_LEVEL Info`, text output |
-| Compile | **327 206 B flash (24 %)**, **24 640 B static RAM (7 %)**, no warnings with `--warnings all` |
+| Build | `build/stage2-af`, `BNO085_LOG_LEVEL Info`, text output |
+| Compile | **327 274 B flash (24 %)**, **24 640 B static RAM (7 %)**, no warnings with `--warnings all` |
 | Static analysis | `build\analyze_msvc.bat`, exit 0, 0 warnings |
-| App image | `01_SingleSensor.ino.bin`, 327 360 B |
-| Flash | COM11 (CH343), esptool wrote and verified the image, `Hash of data verified.`, exit 0 |
+| Host suite | `test\native\build_msvc.bat`, 63 cases / 449 checks, 0 failures |
+| App image / flash | 327 424 B written at `0x10000` on COM11 (CH343), `Hash of data verified.`, exit 0 |
+| Physical capture | `build/stage2/serial_stage2_af.log`, 1776 lines, 18 s, COM11 115 200 8N1 |
 | Board MAC | `94:a9:90:d3:5a:b8` |
 
-### 13.5 Raw COM11 output (final cold boot)
+The two uncommitted changes only expose evidence that already existed:
+
+- `Sh2Client.cpp`: log the channel-0 advertisement summary at Info
+  (`advertisement payload=272 transfer=276`); the full hex stays at Debug.
+- `Esp32SpiHal.cpp`: log a successful wake at Info, one line per host write
+  (`wake: INT after Nus (pad=0)`).
+
+No SPI mode, clock, transport, recovery, or timing code changed.
+
+### 13.5 Raw COM11 output (A-F re-validation cold boot)
 
 One 18 s session at 115 200 8N1. The port was drained and the ESP32 held in reset
 before recording, so the log starts at the ROM banner. Lines are trimmed to the
@@ -581,75 +594,74 @@ bring-up, one early and one late report, and the two host commands; the complete
 file is listed in section 14.
 
 ```
-   0.006  Build:Mar 27 2021
-   0.009  rst:0x1 (POWERON),boot:0x2a (SPI_FAST_FLASH_BOOT)
-   0.009  SPIWP:0xee
-   0.009  mode:DIO, clock div:1
+   0.266  [I] s0 begin cs=10 int=9 rst=8 wake=14 rate=10000us
+   0.273  [I] s0 reset pulse on pin 8 (attempt 0)
+   0.273  [I] s0 boot wait, budget 300ms
+   0.365  [I] advertisement payload=272 transfer=276
+   0.428  [I] s0 reset complete (epoch 1)
+   0.433  [I] s0 device reset complete, identifying
+   0.434  [I] wake: INT after 852us (pad=0)
+   0.439  [I] s0 product id part=10004148 build=6 fw=3.2.13 resetCause=4
+   0.444  [I] s0 configuring rotation vector
+   0.445  [I] wake: INT after 547us (pad=0)
+   0.456  [I] set-feature-tx [17] FD 05 00 00 00 10 27 00 00 00 00 00 00 00 00 00 00
+   0.456  [I] s0 -> set feature 0x05 @ 10000 us
+   0.458  [I] s0 waiting for get-feature response 0x05
+   0.575  [I] get-feature [17] FC 05 00 00 00 10 27 00 00 00 00 00 00 00 00 00 00
+   0.581  [I] s0 report 0x05 granted interval 10000 us (flags=0x00)
+   0.581  [I] s0 streaming at 10000us (requested 10000us)
+   0.592  RV #1 seq=0 acc=unreliable q=0.96613 0.01093 -0.00537 -0.25775 tMeas=507693 dt=3600us
    ...
-   0.281  [I] s0 begin cs=10 int=9 rst=8 wake=14 rate=10000us
-   0.286  [I] s0 reset pulse on pin 8 (attempt 0)
-   0.286  [I] s0 boot wait, budget 300ms
-   0.444  [I] s0 reset complete (epoch 1)
-   0.449  [I] s0 device reset complete, identifying
-   0.454  [I] s0 product id part=10004148 build=6 fw=3.2.13 resetCause=4
-   0.454  [I] s0 configuring rotation vector
-   0.465  [I] s0 -> set feature 0x05 @ 10000 us
-   0.467  [I] s0 waiting for get-feature response 0x05
-   0.590  [I] get-feature [17] FC 05 00 00 00 10 27 00 00 00 00 00 00 00 00 00 00
-   0.596  [I] s0 report 0x05 granted interval 10000 us (flags=0x00)
-   0.596  [I] s0 streaming at 10000us (requested 10000us)
-   0.607  RV #1 seq=0 acc=unreliable q=0.96704 0.01099 -0.00537 -0.25439 tMeas=507801 dt=3600us
+----- HOST SENT 'd' at t=12.006s -----
+  12.020  state=streaming lastError=none stage=5
+  12.020  product=0x0098A6B4 fw=3.2.13  granted=10000us
+  12.025  packets=1149 tx=2 bytes=26683 spiErrors=0 busTimeouts=0
+  12.031  short=0 badChan=0 badFrag=0 oversize=0 seqGaps=0 spurious=0
+  12.036  sh2Timeouts=0 badResp=0 unknown=0 dups=0 gaps=0
+  12.042  resets=1 ints=1147 reports=1143 lastReport=11950804us maxService=12615us
+  12.048  recovery attempts=0 successes=0 failures=0 terminal=0 reason=none
+  12.053  output enabled=0 written=0 suppressed=0 noCap=0 partial=0 failed=0 dropped=0 lastError=none
+----- HOST SENT 'q' at t=13.005s -----
+  13.010  q w=0.966125 x=0.010437 y=-0.005615 z=-0.257874 acc=unreliable
    ...
------ HOST SENT 'd' at t=12.011s -----
-  12.025  state=streaming lastError=none stage=5
-  12.026  product=0x0098A6B4 fw=3.2.13  granted=10000us
-  12.031  packets=1148 tx=2 bytes=26660 spiErrors=0 busTimeouts=0
-  12.036  short=0 badChan=0 badFrag=0 oversize=0 seqGaps=0 spurious=0
-  12.042  sh2Timeouts=0 badResp=0 unknown=0 dups=0 gaps=0
-  12.047  resets=1 ints=1147 reports=1142 lastReport=11940885us maxService=12578us
-  12.053  recovery attempts=0 successes=0 failures=0 terminal=0 reason=none
-  12.058  output enabled=0 written=0 suppressed=0 noCap=0 partial=0 failed=0 dropped=0 lastError=none
------ HOST SENT 'q' at t=13.009s -----
-  13.015  q w=0.967041 x=0.011475 y=-0.005920 z=-0.254395 acc=unreliable
-   ...
-  18.007  RV #1737 seq=201 acc=unreliable q=0.96704 0.01166 -0.00580 -0.25433 tMeas=17929436 dt=2300us
+  18.009  RV #1738 seq=205 acc=unreliable q=0.96613 0.01111 -0.00562 -0.25775 tMeas=17939444 dt=2300us
 ```
 
-### 13.6 Tests A-D
+### 13.6 Tests A-F
 
-| Test | Requirement | Result | Evidence |
+| Stage | Requirement | Result | Evidence |
 |---|---|---|---|
-| A. Boot and WAKE | reset, `wake=14`, hub accepts writes | **PASS** | ROM banner; `begin ... wake=14`; pad read back 0 while low; INT 548-876 us after WAKE low |
-| B. SHTP, Product ID, SH-2 init | advertisement, Product ID, reset-complete, streaming | **PASS** | `reset complete (epoch 1)`; `part=10004148 build=6 fw=3.2.13 resetCause=4`; streaming at 596 ms; one boot epoch, no recovery |
-| C. RV configuration | set 10 000 us and read back the granted period | **PASS** | `set feature 0x05 @ 10000 us`; automatic `FC ... 10 27 ...` = 10 000 us; `granted interval 10000 us`; `streaming at 10000us` |
-| D. Live reports | 100 Hz quaternions, plausible timestamps | **PASS** | 1737 reports / 17.42 s = 99.65 Hz; 99.82 Hz steady; finite quaternions; `dt` 2.0-4.3 ms steady; sequence continuous except one host-induced drop |
+| **A. Reset and WAKE** | PS0 HIGH through reset; WAKE low only for a write; INT response; no 3V3 tie | **PASS** | `begin` configures WAKE HIGH at 0.266 s, reset pulse at 0.273 s; wake at 0.434 s: INT after 852 us with `pad=0`; wake at 0.445 s: INT after 547 us with `pad=0`. Both wakes are host writes; no other LOW drive exists. |
+| **B. Advertisement and reset-complete** | Read the full startup advertisement, then receive reset-complete | **PASS** | `advertisement payload=272 transfer=276` at 0.365 s; `reset complete (epoch 1)` at 0.428 s; no oversize/short/fragment counters |
+| **C. Product ID** | Request and retrieve the Product ID | **PASS** | `product id part=10004148 build=6 fw=3.2.13 resetCause=4` at 0.439 s; `d` reports `product=0x0098A6B4` |
+| **D. SH-2 initialization** | Reach streaming without recovery | **PASS** | Set-feature 0.456 s, get-feature response 0.575 s, `streaming at 10000us` 0.581 s; `resets=1`, `recovery attempts=0` |
+| **E. Rotation Vector at 100 Hz** | Set 10 000 us and confirm the granted period | **PASS** | `set-feature-tx ... 10 27 ...`; hub `FC 05 00 00 00 10 27 ...`; `granted interval 10000 us`; `streaming at 10000us` |
+| **F. Quaternion reports** | Decode live Rotation Vector reports at ~100 Hz | **PASS** | 1738 reports over 17.432 s = 99.65 Hz overall; 99.82 Hz steady; 1738/1738 finite quaternions |
+
+No stage failed, so the sequence continued through F.
 
 ### 13.7 Measured Rotation Vector stream
 
-- 1737 reports between `tMeas=507801` and `tMeas=17929436`, a span of 17.422 s:
-  **99.65 Hz** overall.
+- Overall: 1738 reports between `tMeas=507693` and `tMeas=17939444`, a 17.432 s
+  span = **99.65 Hz**.
 - Steady window 0.7-11.9 s: 1118 reports over 11.19 s = **99.82 Hz**; `tMeas`
-  deltas 8.25-11.74 ms, average 10.02 ms; **no sequence gaps**.
-- The first ~150 ms after streaming starts has startup jitter (deltas
-  3.39-15.49 ms) and settles by RV #9.
-- One report was dropped at the deliberate 50 ms `d` print: `seq 118 -> 120` at
-  12.075 s. The delivered report arrived with `dt=20600 us` and an out-of-order
-  `tMeas` while the queue caught up. This is host back-pressure, not a link
-  error: all SHTP counters stayed at zero.
-- All 1737 quaternions are finite and change smoothly (for example
-  `w=0.96704 x=0.01099 y=-0.00537 z=-0.25439` early and
-  `w=0.96704 x=0.01166 y=-0.00580 z=-0.25433` late).
-- Accuracy was `unreliable` in every report while the board sat still.
-- `dt` (host observation minus hub measurement timestamp) was 2.0-4.3 ms in the
-  steady window, average 2.28 ms. It is not a sensor latency; see section 12.8.
+  deltas 8.51-11.54 ms, average 10.02 ms; no sequence gaps.
+- 1738/1738 quaternions are finite. Example early `w=0.96613 x=0.01093
+  y=-0.00537 z=-0.25775`; late `w=0.96613 x=0.01111 y=-0.00562 z=-0.25775`.
+- `dt` in the steady window: 2.0-3.8 ms, average 2.264 ms. This is a host
+  observation estimate, not sensor latency (section 12.8).
+- One report was dropped at the deliberate 50 ms `d` print: `seq 119 -> 121` at
+  12.075 s. The SHTP counters stayed at zero (`seqGaps=0`), so this is host
+  back-pressure, not a link error.
+- Accuracy was `unreliable` in all 1738 reports while the board was stationary.
 
 ### 13.8 Link and sensor counters at 12 s
 
 ```
-packets=1148 tx=2 bytes=26660 spiErrors=0 busTimeouts=0
+packets=1149 tx=2 bytes=26683 spiErrors=0 busTimeouts=0
 short=0 badChan=0 badFrag=0 oversize=0 seqGaps=0 spurious=0
 sh2Timeouts=0 badResp=0 unknown=0 dups=0 gaps=0
-resets=1 ints=1147 reports=1142 lastReport=11940885us maxService=12578us
+resets=1 ints=1147 reports=1143 lastReport=11950804us maxService=12615us
 recovery attempts=0 successes=0 failures=0 terminal=0 reason=none
 ```
 
@@ -658,7 +670,7 @@ Feature request was sent, confirming the automatic-response path.
 
 ### 13.9 Remaining failures and observations
 
-No test in A-D failed. The following are open observations, not failures of this
+No A-F stage failed. The following are open observations, not failures of this
 run:
 
 1. RV accuracy stayed `unreliable` while stationary. Motion/calibration and
@@ -676,19 +688,41 @@ run:
 ### 13.10 Reproduce
 
 ```
-test\native\build_msvc.bat
+cmd /c test\native\build_msvc.bat
+cmd /c build\analyze_msvc.bat
 arduino-cli compile --fqbn esp32:esp32:esp32s3 --library . ^
-    --build-path build\stage2-final --warnings all examples\01_SingleSensor
+    --build-path build\stage2-af --warnings all examples\01_SingleSensor
 arduino-cli upload -p COM11 --fqbn esp32:esp32:esp32s3 ^
-    --input-dir build\stage2-final examples\01_SingleSensor
+    --input-dir build\stage2-af examples\01_SingleSensor
 powershell -ExecutionPolicy Bypass -File %TEMP%\opencode\serial_capture.ps1 ^
     -Port COM11 -Baud 115200 -Seconds 18 ^
-    -Out build\stage2\serial_final_clean.log ^
+    -Out build\stage2\serial_stage2_af.log ^
     -SendSchedule "12.0|d;13.0|q" -Reset
 ```
 
 The capture helper drains the previous run and holds the ESP32 in reset before it
 starts recording, so the saved log begins at the ROM banner without stale lines.
+
+### 13.11 Prior bring-up run (2026-11-26)
+
+The first Stage 2 WAKE run was made at HEAD `2e9a2d8` with the WAKE/init changes
+uncommitted, build `build/stage2-final`, capture
+`build/stage2/serial_final_clean.log`. It exercised the same A-F sequence:
+
+| Item | 2026-11-26 bring-up |
+|---|---|
+| Firmware | HEAD `2e9a2d8` + uncommitted WAKE/init changes (committed as `fe284f3`) |
+| Build | `build/stage2-final`, 327 206 B flash (24 %), 24 640 B static RAM (7 %) |
+| Capture | 18 s cold boot, `d` at 12 s, `q` at 13 s |
+| WAKE | pad readback 0 while low; INT 548-876 us after WAKE low |
+| Product ID | `part=10004148 build=6 fw=3.2.13 resetCause=4` |
+| Streaming | set 10 000 us, automatic `FC ... 10 27 ...`, granted 10 000 us |
+| Reports | 1737 / 17.422 s = 99.65 Hz overall, 99.82 Hz steady; all finite |
+| Drop | one report at the 50 ms `d` print (`seq 118 -> 120`); SHTP counters zero |
+
+That run exposed the WAKE, automatic-get-feature and Product ID diagnostics issues
+that `fe284f3` fixed. It is kept as the bring-up record; the A-F run above is the
+current acceptance evidence.
 
 ---
 
@@ -698,7 +732,9 @@ Tracked changes are listed in the final checkpoint. Untracked build/capture arti
 
 | File | Contents |
 |---|---|
-| `build/stage2-final/` | final WAKE build; flashed to the board |
+| `build/stage2-af/` | A-F re-validation build (HEAD `fe284f3` + two Info logging lines); flashed to the board |
+| `build/stage2/serial_stage2_af.log` | A-F 18 s cold boot, `d` at 12 s, `q` at 13 s |
+| `build/stage2-final/` | final WAKE build from the 2026-11-26 run |
 | `build/stage2/serial_final_clean.log` | final 18 s cold boot, `d` at 12 s, `q` at 13 s |
 | `build/stage2/serial_diag*.log` | diagnostic iterations: fixed pulse failure, pad readback, stale get-feature |
 | `build/stage2-diag/` | Info diagnostic build used for those iterations |
@@ -714,8 +750,8 @@ Tracked changes are listed in the final checkpoint. Untracked build/capture arti
 | `build/stage1/probe_write_while_int.log` | F9 while INT asserted: 0xF8 response |
 | `build/stage1/serial_final.log` | pre-ordering cold boot: `552 > 512` (second cause) |
 
-Commands used for this stage (PowerShell from the repository root; Arduino CLI
-at `C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`):
+Commands used for the 2026-11-26 bring-up (PowerShell from the repository root;
+Arduino CLI at `C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`):
 
 ```
 cmd /c test\native\build_msvc.bat
@@ -726,3 +762,13 @@ powershell -ExecutionPolicy Bypass -File %TEMP%\opencode\serial_capture.ps1 -Por
 
 Host suite result: `BNO085Multi host tests (63 cases)`, `449 checks, 0 failures`,
 `RESULT: PASS`.
+
+A-F re-validation commands (2026-11-27):
+
+```
+cmd /c test\native\build_msvc.bat
+cmd /c build\analyze_msvc.bat
+arduino-cli compile --fqbn esp32:esp32:esp32s3 --library . --build-path build\stage2-af --warnings all examples\01_SingleSensor
+arduino-cli upload -p COM11 --fqbn esp32:esp32:esp32s3 --input-dir build\stage2-af examples\01_SingleSensor
+powershell -ExecutionPolicy Bypass -File %TEMP%\opencode\serial_capture.ps1 -Port COM11 -Baud 115200 -Seconds 18 -Out build\stage2\serial_stage2_af.log -SendSchedule "12.0|d;13.0|q" -Reset
+```

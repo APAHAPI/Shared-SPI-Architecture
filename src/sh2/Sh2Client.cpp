@@ -53,7 +53,15 @@ void Sh2Client::handlePayload(uint8_t channel, const uint8_t* payload,
                               uint16_t len, uint32_t tUs) {
   switch (channel) {
     case shtp::kChannelCommand:
-      if (log_) log_->hex(LogLevel::Debug, LogShtp, "advertisement", payload, len);
+      if (log_) {
+        // One line per boot: the channel-0 advertisement is the proof that the
+        // 276-byte transfer was read coherently (272-byte payload + 4-byte SHTP
+        // header). The full hex remains available at Debug.
+        log_->log(LogLevel::Info, LogShtp,
+                  "advertisement payload=%u transfer=%u",
+                  static_cast<unsigned>(len), static_cast<unsigned>(len + 4u));
+        log_->hex(LogLevel::Debug, LogShtp, "advertisement", payload, len);
+      }
       break;
     case shtp::kChannelExecutable:
       handleExecutable(payload, len);

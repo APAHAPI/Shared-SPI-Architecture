@@ -167,8 +167,10 @@ bool Esp32SpiHal::prepareWrite() {
     if (intAsserted()) {
       const uint32_t waited = micros() - start;
       digitalWrite(config_->wakePin, HIGH);
-      if (log_.enabled(LogLevel::Debug, LogSpi)) {
-        log_.log(LogLevel::Debug, LogSpi, "wake: INT after %luus (pad=%d)",
+      // One line per host write: the pad readback proves WAKE was actually
+      // driven low (no 3V3 tie), and the interval is the observed wake time.
+      if (log_.enabled(LogLevel::Info, LogSpi)) {
+        log_.log(LogLevel::Info, LogSpi, "wake: INT after %luus (pad=%d)",
                  static_cast<unsigned long>(waited), readback);
       }
       return true;
