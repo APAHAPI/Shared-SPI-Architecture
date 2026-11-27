@@ -1,58 +1,86 @@
-# Latest response (2026-11-27)
+# Latest response (2026-11-27) — Stage 2 review
 
-Validation and report update are complete. The report and the two logging-source changes were committed externally as `60aef72`; I made no new commit. This handoff file, `output.md`, is the only working-tree modification.
+## Repository state at review start
 
-## Final checkpoint
+- Branch `main`; HEAD `2e89b86` (`Refresh Stage 2 validation handoff`).
+- Working tree was clean; no staged files.
+- The described eight-file change set is already committed across `fe284f3`
+  (`Fix BNO085 WAKE and feature initialization`) and `60aef72`
+  (`Log SPI wake and advertisement evidence`), not uncommitted.
+- `2e9a2d8..HEAD` modifies 8 implementation/report files plus `output.md`.
+  No files were added or deleted.
 
-**HEAD:** `60aef72` (`Log SPI wake and advertisement evidence`)
+## Verdict
 
-**Working tree:**
-```
- M output.md
-```
+No blocking defect found. The WAKE fix and the delayed feature-response fix are
+correct for the single-sensor path and were independently re-verified on the
+board. The code is ready for the current commit line; there is nothing left to
+commit in the eight-file set.
 
-`git diff --check` exits 0. Nothing staged or committed by this turn. The LF→CRLF messages are Git's normal line-ending notices.
+## Findings, ranked
 
-**Commit `60aef72` contains:**
-```
- hardware_test_report.md | 212 +++++++++++++++++++++++++++++-------------------
- src/hal/Esp32SpiHal.cpp |   6 +-
- src/sh2/Sh2Client.cpp   |  10 ++-
-```
+1. **Medium, pre-existing:** runtime `Sensor::configure()` still sends a Set
+   Feature without arming `expectFeatureResponse()`. The hub's automatic 0xFC is
+   therefore counted as unexpected, and `grantedIntervalUs` / diagnostics are not
+   refreshed. Not exercised by the current init path, but relevant to Phase 2 and
+   multi-sensor runtime reconfiguration.
+2. **Low:** `Esp32SpiHal::prepareWrite()` returns `true` even when WAKE does not
+   assert INT within 2 ms. The warning is logged, but the caller still writes.
+   With PS0 wired, a failed wake can therefore produce a command timeout and
+   recovery instead of a clean send failure.
+3. **Low:** the 2 ms wake wait is a blocking loop, and the 250 ms feature-apply
+   window is a compile-time constant rather than a `ManagerConfig` value. Fine for
+   two boot writes and the measured ~119 ms response, but not tunable for a slow
+   hub or many sensors.
+4. **Low:** `handleGetFeatureResponse()` accepts any granted interval, including
+   zero, and matches only by report ID. A stale 0xFC for the same report could
+   satisfy a later expectation. The new 250 ms path avoids the observed problem,
+   but there is no explicit stale/zero guard.
+5. **Info:** `Sh2Client::getFeature()` is now unused by the production state
+   machine. It is harmless dead API.
 
-## Report changes (now committed)
+## Fix assessment
 
-- **§13.4** carries the current identity: HEAD `fe284f3` at test time, `build/stage2-af`, 327 274 B flash / 24 640 B RAM, 327 424 B written and hash-verified, host suite 63 cases / 449 checks, static analysis clean.
-- **§13.5** is the fresh `serial_stage2_af.log` capture.
-- **§13.6** explicitly lists **A–F**, all PASS.
-- **§13.7–13.9** report 1738 reports / 17.432 s, 99.65 Hz overall, 99.82 Hz steady, all finite; zero link errors; one host-induced drop during `d`.
-- **§13.11** is a compact 2026-11-26 bring-up record, so current acceptance evidence comes first.
-- Header, verdict table, reproduce commands, and artifact list are reconciled with the current build and capture.
+- **WAKE:** correct. `begin()` drives WAKE HIGH before the NRST pulse; WAKE is
+  driven LOW only in `prepareWrite()`, held until INT (bounded at 2 ms), then
+  restored HIGH. Pad readback is captured while low.
+- **Feature application:** correct for init. Set Feature is sent once; the host
+  waits for the hub's automatic Get Feature Response for 250 ms instead of
+  issuing an immediate Get Feature. Measured response was ~119 ms and granted
+  10 000 us.
 
-## Test outcome
+## Tests and build
 
-All A–F stages passed:
+- Host suite: **63 cases, 449 checks, 0 failures**, `RESULT: PASS`.
+- Static analysis: completed with no diagnostics.
+- ESP32-S3 build: **327 274 B flash (24%)**, **24 640 B RAM (7%)**, no warnings.
+- Flash: 327 424 B, `Hash of data verified.`, exit 0.
 
-| Stage | Result |
-|---|---|
-| A. Reset and WAKE | PASS — WAKE idle HIGH, reset pulse, INT after 852 µs / 547 µs, `pad=0` |
-| B. Advertisement / reset-complete | PASS — payload 272, transfer 276 at 0.365 s; reset-complete 0.428 s |
-| C. Product ID | PASS — `part=10004148 build=6 fw=3.2.13 resetCause=4` |
-| D. SH-2 initialization | PASS — streaming at 0.581 s, `resets=1`, no recovery |
-| E. Rotation Vector config | PASS — requested/granted 10 000 µs |
-| F. Quaternions | PASS — 1738 reports, 99.65 Hz overall, all finite |
+## Physical repeat on COM11
 
-**Open observations, not failures:** RV accuracy remained `unreliable` while stationary; no explicit get-feature retry if the automatic `0xFC` is lost; the blocking `d` print drops one sample; no soak, fault, or multi-sensor testing was performed.
+The current review build was flashed (no wiring change) and captured for 18 s at
+115 200 8N1 to `build/stage2/review_stage2.log` (1784 lines).
 
-## Evidence
+- Advertisement: payload 272 / transfer 276.
+- WAKE: INT after 856 us and 548 us, `pad=0` both times.
+- Product ID: `part=10004148 build=6 fw=3.2.13 resetCause=4`.
+- Streaming began at 0.596 s; granted interval 10 000 us; `tx=2`.
+- 1738 reports over 17.4217 s = **99.70 Hz** using `(N-1)/span`.
+- `spiErrors=0 busTimeouts=0 badFrag=0 oversize=0 seqGaps=0 spurious=0`
+  `sh2Timeouts=0 badResp=0`; `resets=1`; recovery attempts 0.
+- One host-induced sequence gap (`118 -> 120`) at the 50 ms `d` print.
+- All quaternions finite; accuracy remained `unreliable` while stationary.
 
-- Host suite: 63 cases / 449 checks, 0 failures.
-- Static analysis: exit 0, 0 warnings.
-- ESP32-S3 build: 327 274 B flash (24%), 24 640 B RAM (7%), no warnings.
-- Flash: COM11, 327 424 B written, hash verified, exit 0.
-- Capture: `build/stage2/serial_stage2_af.log`, 1776 lines, 18 s.
-- Link counters: `spiErrors=0 busTimeouts=0 badFrag=0 oversize=0 seqGaps=0 spurious=0 sh2Timeouts=0 badResp=0`; `resets=1`; `tx=2`.
+## Remaining validation gaps
 
-## Next action
+- No motion/calibration test, so RV accuracy remains `unreliable`.
+- No soak, fault injection, output-loss-under-load, recovery-under-load, or
+  multi-sensor test.
+- No test of runtime `configure()`, the wake-timeout path, or a stale/zero
+  Get Feature Response.
 
-Review commit `60aef72`. Do not begin Phase 2, soak, fault injection, or multi-sensor work.
+## Final git state
+
+At review start the worktree was clean and `git diff` was empty. The only change
+made by this review handoff is this `output.md` update; no source, test, report,
+or hardware configuration was changed.
