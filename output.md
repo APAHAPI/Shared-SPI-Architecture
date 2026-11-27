@@ -1,86 +1,138 @@
-# Latest response (2026-11-27) — Stage 2 review
+# Latest response — Independent review of `60aef72` (2026-11-27)
 
-## Repository state at review start
+## Repository state
 
-- Branch `main`; HEAD `2e89b86` (`Refresh Stage 2 validation handoff`).
-- Working tree was clean; no staged files.
-- The described eight-file change set is already committed across `fe284f3`
-  (`Fix BNO085 WAKE and feature initialization`) and `60aef72`
-  (`Log SPI wake and advertisement evidence`), not uncommitted.
-- `2e9a2d8..HEAD` modifies 8 implementation/report files plus `output.md`.
-  No files were added or deleted.
+- Branch `main`; HEAD `40bbddc` (`Update output.md`).
+- `60aef72` (`Log SPI wake and advertisement evidence`) is two commits behind HEAD.
+- `git diff 60aef72..HEAD -- src/hal/Esp32SpiHal.cpp src/sh2/Sh2Client.cpp hardware_test_report.md` is empty.
+- The only post-`60aef72` change is `output.md` (`2e89b86`, `40bbddc`).
+- At review start the worktree was clean; nothing staged.
 
 ## Verdict
 
-No blocking defect found. The WAKE fix and the delayed feature-response fix are
-correct for the single-sensor path and were independently re-verified on the
-board. The code is ready for the current commit line; there is nothing left to
-commit in the eight-file set.
+**APPROVE WITH NOTES.**
+
+`60aef72` is suitable as the current Stage 2 baseline. It is an evidence/logging
+and report commit, not a behavioral change. The WAKE and automatic feature-response
+logic it documents comes from parent `fe284f3` and is correct for the single-sensor
+path.
+
+## What the commit changes
+
+| File | Change |
+|---|---|
+| `src/hal/Esp32SpiHal.cpp:167-176` | Promotes the successful wake log from Debug to Info. No WAKE timing or GPIO changes. |
+| `src/sh2/Sh2Client.cpp:53-64` | Adds an Info advertisement-size summary; full hex remains at Debug. No SH-2 state changes. |
+| `hardware_test_report.md` | Updates A–D to A–F, records the 2026-11-27 re-validation, keeps the earlier run as history. |
+
+## Code review
+
+### WAKE / `Esp32SpiHal.cpp`
+
+- GPIO14 is configured in `examples/01_SingleSensor/01_SingleSensor.ino:45`.
+- `begin()` configures WAKE HIGH before the reset pulse.
+- `prepareWrite()` at `src/hal/Esp32SpiHal.cpp:151-191` drives WAKE LOW, reads the
+  pad back, holds LOW until INT or 2 ms, restores HIGH on both paths.
+- No path leaves WAKE low after return.
+- 2 ms wait is bounded but blocking. Acceptable for two boot writes; note for
+  multi-sensor runtime traffic.
+- No mutable global state, no cross-sensor coupling, no SPI from ISR, no CS change.
+
+### SH-2 / `Sh2Client.cpp`
+
+- Automatic `0xFC` handling is instance-local: `featurePending_`, `featureId_`,
+  `featureDeadlineUs_`, `cmdState_`, `featureState_`.
+- `expectFeatureResponse()` arms a 250 ms wait; `pollTimeouts()` converts a missing
+  response into a bounded recovery.
+- Response matching is by report ID only; no sequence/epoch and no explicit retry.
+  Safe for one-shot init, but a stale same-report response is a future risk.
+- `60aef72` itself only adds the advertisement log; it does not alter this state
+  machine.
 
 ## Findings, ranked
 
-1. **Medium, pre-existing:** runtime `Sensor::configure()` still sends a Set
-   Feature without arming `expectFeatureResponse()`. The hub's automatic 0xFC is
-   therefore counted as unexpected, and `grantedIntervalUs` / diagnostics are not
-   refreshed. Not exercised by the current init path, but relevant to Phase 2 and
-   multi-sensor runtime reconfiguration.
-2. **Low:** `Esp32SpiHal::prepareWrite()` returns `true` even when WAKE does not
-   assert INT within 2 ms. The warning is logged, but the caller still writes.
-   With PS0 wired, a failed wake can therefore produce a command timeout and
-   recovery instead of a clean send failure.
-3. **Low:** the 2 ms wake wait is a blocking loop, and the 250 ms feature-apply
-   window is a compile-time constant rather than a `ManagerConfig` value. Fine for
-   two boot writes and the measured ~119 ms response, but not tunable for a slow
-   hub or many sensors.
-4. **Low:** `handleGetFeatureResponse()` accepts any granted interval, including
-   zero, and matches only by report ID. A stale 0xFC for the same report could
-   satisfy a later expectation. The new 250 ms path avoids the observed problem,
-   but there is no explicit stale/zero guard.
-5. **Info:** `Sh2Client::getFeature()` is now unused by the production state
-   machine. It is harmless dead API.
+| Severity | Finding | File/line | Assessment |
+|---|---|---|---|
+| Low | Advertisement log omits `sensorId_`; multi-sensor logs would be ambiguous. | `src/sh2/Sh2Client.cpp:60-62` | Acceptable for one sensor; add ID before multi-sensor. |
+| Low | Wake log omits sensor/pin and is Info; one synchronous serial line per write can briefly block. | `src/hal/Esp32SpiHal.cpp:172-174` | Acceptable for validation; prefer Debug/non-blocking in production. |
+| Info | Comment says "one line per boot," but code logs every channel-0 payload. | `src/sh2/Sh2Client.cpp:57-62` | Comment/edge-case wording only. |
+| Note (inherited) | `prepareWrite()` returns true after a 2 ms wake timeout, so the write is still attempted. | `src/hal/Esp32SpiHal.cpp:151-191` | Pre-existing; no timeout observed. |
+| Note (inherited) | No stale-response guard and no explicit `0xFC` retry. | `src/sh2/Sh2Client.cpp:449-461`, `516-526` | Safe for current init; review before runtime reconfig/multi-sensor. |
 
-## Fix assessment
+## Evidence verification
 
-- **WAKE:** correct. `begin()` drives WAKE HIGH before the NRST pulse; WAKE is
-  driven LOW only in `prepareWrite()`, held until INT (bounded at 2 ms), then
-  restored HIGH. Pad readback is captured while low.
-- **Feature application:** correct for init. Set Feature is sent once; the host
-  waits for the hub's automatic Get Feature Response for 250 ms instead of
-  issuing an immediate Get Feature. Measured response was ~119 ms and granted
-  10 000 us.
+- Code supports Product ID `10004148`, firmware `3.2.13`, RV `0x05` at 10 000 us,
+  and quaternion decoding.
+- Host suite: 63 cases / 449 checks / 0 failures (same source tree).
+- ESP32-S3 build: 327 274 B flash / 24 640 B RAM, no warnings.
+- Flash: 327 424 B, hash verified.
+- Prior hardware run on the same source: 1 738 reports over 17.4217 s = 99.70 Hz,
+  zero link errors, one host-induced gap at the blocking `d` print.
+- No new hardware test was run for this commit; `60aef72` changes no behavior.
 
-## Tests and build
+## Remaining observations
 
-- Host suite: **63 cases, 449 checks, 0 failures**, `RESULT: PASS`.
-- Static analysis: completed with no diagnostics.
-- ESP32-S3 build: **327 274 B flash (24%)**, **24 640 B RAM (7%)**, no warnings.
-- Flash: 327 424 B, `Hash of data verified.`, exit 0.
+| Observation | Classification |
+|---|---|
+| RV accuracy `unreliable` while stationary | Acceptable for current milestone; motion/calibration still untested. |
+| No explicit `0xFC` retry | Acceptable now; must address before multi-sensor to avoid reset-on-loss. |
+| Blocking `d` print drops one sample | Acceptable; diagnostic text path only. Use binary/non-blocking in production. |
+| No soak/fault/multi-sensor testing | Acceptable for this commit; required before Phase 2/multi-sensor. |
 
-## Physical repeat on COM11
+None is a commit blocker for `60aef72`.
 
-The current review build was flashed (no wiring change) and captured for 18 s at
-115 200 8N1 to `build/stage2/review_stage2.log` (1784 lines).
+## Source diff from the commit
 
-- Advertisement: payload 272 / transfer 276.
-- WAKE: INT after 856 us and 548 us, `pad=0` both times.
-- Product ID: `part=10004148 build=6 fw=3.2.13 resetCause=4`.
-- Streaming began at 0.596 s; granted interval 10 000 us; `tx=2`.
-- 1738 reports over 17.4217 s = **99.70 Hz** using `(N-1)/span`.
-- `spiErrors=0 busTimeouts=0 badFrag=0 oversize=0 seqGaps=0 spurious=0`
-  `sh2Timeouts=0 badResp=0`; `resets=1`; recovery attempts 0.
-- One host-induced sequence gap (`118 -> 120`) at the 50 ms `d` print.
-- All quaternions finite; accuracy remained `unreliable` while stationary.
+```diff
+diff --git a/src/hal/Esp32SpiHal.cpp b/src/hal/Esp32SpiHal.cpp
+index edbc900..31bd8e0 100644
+--- a/src/hal/Esp32SpiHal.cpp
++++ b/src/hal/Esp32SpiHal.cpp
+@@ -167,8 +167,10 @@ bool Esp32SpiHal::prepareWrite() {
+     if (intAsserted()) {
+       const uint32_t waited = micros() - start;
+       digitalWrite(config_->wakePin, HIGH);
+-      if (log_.enabled(LogLevel::Debug, LogSpi)) {
+-        log_.log(LogLevel::Debug, LogSpi, "wake: INT after %luus (pad=%d)",
++      // One line per host write: the pad readback proves WAKE was actually
++      // driven low (no 3V3 tie), and the interval is the observed wake time.
++      if (log_.enabled(LogLevel::Info, LogSpi)) {
++        log_.log(LogLevel::Info, LogSpi, "wake: INT after %luus (pad=%d)",
+                  static_cast<unsigned long>(waited), readback);
+       }
+       return true;
+diff --git a/src/sh2/Sh2Client.cpp b/src/sh2/Sh2Client.cpp
+index a3003c7..528a6bb 100644
+--- a/src/sh2/Sh2Client.cpp
++++ b/src/sh2/Sh2Client.cpp
+@@ -53,7 +53,15 @@ void Sh2Client::handlePayload(uint8_t channel, const uint8_t* payload,
+                               uint16_t len, uint32_t tUs) {
+   switch (channel) {
+     case shtp::kChannelCommand:
+-      if (log_) log_->hex(LogLevel::Debug, LogShtp, "advertisement", payload, len);
++      if (log_) {
++        // One line per boot: the channel-0 advertisement is the proof that the
++        // 276-byte transfer was read coherently (272-byte payload + 4-byte SHTP
++        // header). The full hex remains available at Debug.
++        log_->log(LogLevel::Info, LogShtp,
++                  "advertisement payload=%u transfer=%u",
++                  static_cast<unsigned>(len), static_cast<unsigned>(len + 4u));
++        log_->hex(LogLevel::Debug, LogShtp, "advertisement", payload, len);
++      }
+       break;
+     case shtp::kChannelExecutable:
+       handleExecutable(payload, len);
+```
 
-## Remaining validation gaps
+The `hardware_test_report.md` portion of the commit is documentation-only; its full
+diff is available with:
 
-- No motion/calibration test, so RV accuracy remains `unreliable`.
-- No soak, fault injection, output-loss-under-load, recovery-under-load, or
-  multi-sensor test.
-- No test of runtime `configure()`, the wake-timeout path, or a stale/zero
-  Get Feature Response.
+```
+git show 60aef72 -- hardware_test_report.md
+```
 
-## Final git state
+## Final state
 
-At review start the worktree was clean and `git diff` was empty. The only change
-made by this review handoff is this `output.md` update; no source, test, report,
-or hardware configuration was changed.
+At review start: clean worktree, `git diff` empty. This handoff updates
+`output.md` only; no source, test, report, or hardware configuration was changed.
+Nothing was staged, committed, pushed, reset, or discarded.
